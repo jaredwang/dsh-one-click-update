@@ -2,6 +2,7 @@
 
 [![CI](https://github.com/jaredwang/dsh-one-click-update/actions/workflows/ci.yml/badge.svg)](https://github.com/jaredwang/dsh-one-click-update/actions/workflows/ci.yml)
 [![license: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![npm](https://img.shields.io/npm/v/dsh-one-click-update.svg)](https://www.npmjs.com/package/dsh-one-click-update)
 
 > DSH 桌面端的「一键更新」入口：在 Harness Web UI 侧边栏点一下，就把 **DSH 桌面 App** 和**插件市场里所有已安装且可更新的插件**一起更新到最新版本。
 
@@ -69,20 +70,20 @@ test/smoke.mjs      离线冒烟测试（mini React + 伪 fetch/桥，42 项断�
 
 ## 安装 / 卸载
 
-当前尚未发布到 npm / 收录进插件市场，直接从 GitHub 安装（需要本机已登录 GitHub，`dsh plugin` 会把参数转给 pnpm）：
+已发布到 npm（[`dsh-one-click-update`](https://www.npmjs.com/package/dsh-one-click-update)），也可以直接从 GitHub 安装；`dsh plugin` 会把参数转给 pnpm：
 
 ```bash
-# 从 GitHub 安装（桌面 App 使用的 profile 是 desktop）
-dsh plugin --profile desktop add github:jaredwang/dsh-one-click-update
+# 从 npm 安装（推荐，桌面 App 使用的 profile 是 desktop）
+dsh plugin --profile desktop add dsh-one-click-update
 
-# 普通 dsh web
-dsh plugin --profile web add github:jaredwang/dsh-one-click-update
+# 从 GitHub 安装（与 npm 上发布的是同一份代码）
+dsh plugin --profile desktop add github:jaredwang/dsh-one-click-update
 
 # 本地开发（从工作区目录安装）
 dsh plugin --profile desktop add /absolute/path/to/dsh-one-click-update
 ```
 
-安装后刷新页面（桌面 App 内 `Cmd+R`）即可看到入口。
+普通 `dsh web` 把 `--profile desktop` 换成 `--profile web` 即可。安装后刷新页面（桌面 App 内 `Cmd+R`）就能看到侧边栏入口。
 卸载：让 Harness 内的 `plugin_manager` 以 `remove_bundle` 移除 `dsh-one-click-update`，或 `dsh plugin --profile desktop remove dsh-one-click-update`。
 
 ## 开发自检

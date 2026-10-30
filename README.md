@@ -12,7 +12,7 @@ A one-click update entry for the [DSH](https://github.com/deepseek-ai/deepseek-h
 一次进入更新页 = 一次「全部更新」，顺序固定：
 
 1. **插件市场**：先读插件市场公开的 [Update API v1](https://www.npmjs.com/package/dshmarket)（`GET /dsh-market/api/v1/capabilities` 与 `GET /dsh-market/api/v1/updates/summary`），拿到所有可更新插件。
-2. 对每个可更新插件**串行**发 `POST /dsh-market/api/v1/updates`，然后轮询 `GET /dsh-market/api/v1/operations?operationId=…`（700ms 一次，8 分钟上限），逐行显示 `已安装版本 → 目标版本` 与状态；失败的插件显示原因（如“发布太新”“版本未变化”），可点「重试失败项」。
+2. 对每个可更新插件**串行**发 `POST /dsh-market/api/v1/updates`，然后轮询 `GET /dsh-market/api/v1/operations?operationId=…`（700ms 一次，8 分钟上限），逐行显示 `已安装版本 → 目标版本` 与状态；失败的插件显示插件市场返回的失败原因（例如 `RELEASE_TOO_FRESH` → 「发布太新」），可点「重试失败项」。
 3. **DSH 桌面 App**：再读桌面端注入的 `window.dshDesktop.updates`（`status()` / `subscribe()` / `open()`）；只有确实存在新版本时页面才自动调用 `updates.open()`（检查 → 下载 → 安装 → 重启），避免每次打开都弹原生「已是最新」框。
 4. 入口图标综合两边状态：有新版本 = 品牌色 + 呼吸圆点；正在更新 = 环形进度；出错 = 红色警示。
 
@@ -24,12 +24,12 @@ A one-click update entry for the [DSH](https://github.com/deepseek-ai/deepseek-h
 | 发现更新 | 品牌色 + 呼吸圆点 | N 个插件可更新 / 发现新版本 vX.Y.Z |
 | 插件更新中 | 环形进度（真实 percent） | 正在更新 name（done/total）+ 进度条 + 行状态 |
 | App 下载/安装 | 环形进度 | 百分比 + 进度条 |
-| 完成 | 灰色 | 插件更新完成（N 个失败）/ 1 个插件需要重启后生效 |
+| 完成 | 灰色 | 插件更新完成（N 个失败）/ 需要重启 DSH 桌面 App 后生效 |
 | 失败 | 红色警示 | 失败原因 + 重试 |
 
 ## 用到的接口
 
-插件市场（同源、经桌面 App 的 IPC 桥转发，带 `sec-fetch-site: same-origin`）：
+插件市场（页面内同源 `fetch`：桌面 App 内由 `dsh-app://` 协议转发到本机 Host，浏览器内直接访问同一源）：
 
 | 方法 | 路径 | 用途 |
 | --- | --- | --- |
@@ -51,9 +51,9 @@ A one-click update entry for the [DSH](https://github.com/deepseek-ai/deepseek-h
 
 ## 装在哪里 / 与皮肤的关系
 
-- 入口 = 侧边栏左上角 `sidebar.panellist` 列表中的一行（`order: 5`，默认位于「插件市场」和「自动化任务」之间），文案由注册的 `label` 提供，图标由本插件渲染，与会话/插件入口完全同款；侧边栏折叠时同样可见。
+- 入口 = 侧边栏左上角 `sidebar.panellist` 列表中的一行（`order: 5`，默认位于「插件市场」和「自动化任务」之间），文案由注册的 `label` 提供，图标由本插件渲染，与会话/插件入口同款。
 - 主面板页注册在 `main` 的 keyed 条目（key = `one-click-update`），点入口行会切到该页，不会出现 `layout.selectPanel: main panel "one-click-update" is not registered`。
-- 在 dsh-claude-style 等皮肤下也走同一套 `sidebar.panellist` 入口，不依赖皮肤私有属性，也不需要任何 DOM hack。
+- 皮肤不影响入口：始终走同一套 `sidebar.panellist` slot，不依赖皮肤私有属性，也不需要 DOM hack。
 
 ## 结构
 
@@ -64,12 +64,12 @@ index.js            Host 半部：空实现（本插件不需要 Host 能力，�
 client.js           浏览器半部：slot 注册 + 更新状态机 + React 组件
 locale/{zh,en}.json 插件管理器里显示的标题与描述
 icon.svg            64x64 图标
-test/smoke.mjs      离线冒烟测试（mini React + 伪 fetch/桥，40 项断言）
+test/smoke.mjs      离线冒烟测试（mini React + 伪 fetch/桥，42 项断言）
 ```
 
 ## 安装 / 卸载
 
-在 DSH 桌面 App 内的 **设置 → 插件** 里搜索并安装，或使用 CLI：
+当前尚未发布到 npm / 收录进插件市场，直接从 GitHub 安装（需要本机已登录 GitHub，`dsh plugin` 会把参数转给 pnpm）：
 
 ```bash
 # 从 GitHub 安装（桌面 App 使用的 profile 是 desktop）
@@ -92,7 +92,7 @@ npm test        # = node test/smoke.mjs，离线冒烟：注册、状态机、�
 node --check client.js
 ```
 
-冒烟测试不依赖任何 npm 包：它用一个 mini React 与伪 `fetch` / 伪桌面桥渲染真实的 `client.js`，覆盖自动开始、串行更新、失败重试、无插件市场、无桌面桥等路径。
+冒烟测试不依赖任何 npm 包：它用一个 mini React 与伪 `fetch` / 伪桌面桥渲染真实的 `client.js`，覆盖自动开始、串行更新、失败重试、无插件市场、无桌面桥，以及 App 状态晚到（慢 `updates.status()`）仍会自动打开更新等路径。
 
 ## 许可证
 

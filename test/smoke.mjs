@@ -138,10 +138,11 @@ function makeDocument() {
 }
 
 const bridgeCalls = { status: 0, subscribe: 0, open: 0, listeners: [] };
-function makeBridge(phase) {
+function makeBridge(phase, delayMs) {
 	return {
 		status: async () => {
 			bridgeCalls.status++;
+			if (delayMs) await sleep(delayMs);
 			if (phase === undefined) return { phase: "idle" };
 			if (phase === "available") return { phase, version: "9.9.9", percent: 0 };
 			return { phase };
@@ -305,7 +306,7 @@ async function load(options) {
 			}
 		}
 	};
-	if (options.bridge !== false) sandbox.window.dshDesktop = { updates: makeBridge(options.appPhase) };
+	if (options.bridge !== false) sandbox.window.dshDesktop = { updates: makeBridge(options.appPhase, options.statusDelay) };
 	mod.apply(ctx);
 	const t = ctx.locale.bind("dsh-one-click-update");
 	return { sandbox, api, mod, React, requires, dicts, registered, injectedKeys, document, t, sandboxDocument: document };
@@ -419,6 +420,22 @@ async function load(options) {
 	const text = JSON.stringify(view.output);
 	ok("no bridge explains app limit", text.includes("仅在桌面 App 内可用"), text.slice(0, 800));
 	ok("no bridge disables app button", text.includes('"disabled":true'), text.slice(0, 800));
+	view.unmount();
+}
+
+/* ------------------------------------------------------------------ */
+/* Scenario 5 — late app status reply after the plugin run             */
+/* ------------------------------------------------------------------ */
+{
+	const before = bridgeCalls.open;
+	const env = await load({ appPhase: "available", packages: [], statusDelay: 400 });
+	await sleep(80);
+	const page = env.registered.find((r) => r.options.name === "main");
+	const view = env.React.mount(page.component, { t: env.t });
+	await sleep(150);
+	ok("late app status: no open before the reply", bridgeCalls.open === before, bridgeCalls.open);
+	await sleep(600);
+	ok("late app status still auto-opens once", bridgeCalls.open === before + 1, bridgeCalls.open);
 	view.unmount();
 }
 

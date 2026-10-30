@@ -254,9 +254,14 @@ window.__ModuleLoader__.load({
 		let detachBridge = null;
 		/** One automatic run per session; the buttons still allow manual reruns. */
 		let autoRunStarted = false;
+		/** Whether the update page is currently mounted (both auto flows only run there). */
+		let panelOpen = false;
+		/** One automatic app open per session, attempted only after the plugin run finished. */
+		let autoAppRequested = false;
 
 		function emit() {
 			for (const listener of [...listeners]) listener();
+			maybeAutoOpenApp();
 		}
 
 		function patchApp(next) {
@@ -346,6 +351,20 @@ window.__ModuleLoader__.load({
 				.then(() => updates.open())
 				.catch(() => {})
 				.then(() => patchApp({ pending: false }));
+		}
+
+		/**
+		 * Open the official app flow at most once per session, only while the update
+		 * page is open and only after this visit's plugin run finished. Called from
+		 * every state change so a late `updates.status()` reply cannot lose the
+		 * automatic open that the page's one-click run is supposed to trigger.
+		 */
+		function maybeAutoOpenApp() {
+			if (!panelOpen || autoAppRequested || !autoRunStarted) return;
+			if (!state.market.finished) return;
+			if (!state.app.supported || state.app.phase !== "available") return;
+			autoAppRequested = true;
+			requestAppUpdate();
 		}
 
 		/* ---------------------------------------------------------------- */
@@ -904,13 +923,22 @@ window.__ModuleLoader__.load({
 			const market = snapshot.market;
 
 			React.useEffect(() => {
+				panelOpen = true;
+				return () => {
+					panelOpen = false;
+				};
+			}, []);
+
+			React.useEffect(() => {
 				if (autoRunStarted) return;
 				if (market.status !== "ready") return;
 				autoRunStarted = true;
 				void (async () => {
 					if (state.market.updatable > 0) await runPluginUpdates(void 0);
 					else patchMarket({ finished: true });
-					if (state.app.supported && state.app.phase === "available") requestAppUpdate();
+					// The app open is triggered by the finished state change itself
+					// (maybeAutoOpenApp), so a slow updates.status() reply cannot lose it.
+					maybeAutoOpenApp();
 				})();
 			}, [market.status]);
 

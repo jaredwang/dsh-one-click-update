@@ -1,0 +1,60 @@
+{
+  "name": "dsh-one-click-update",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "One-click update entry for the DSH desktop app: updates the app itself and every installed plugin-market plugin from the Harness Web UI sidebar.",
+  "license": "MIT",
+  "author": "Jared Wang",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/jaredwang/dsh-one-click-update.git"
+  },
+  "homepage": "https://github.com/jaredwang/dsh-one-click-update#readme",
+  "bugs": {
+    "url": "https://github.com/jaredwang/dsh-one-click-update/issues"
+  },
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness",
+    "cordis",
+    "web-ui",
+    "update",
+    "updater",
+    "desktop"
+  ],
+  "engines": {
+    "dsh": ">=0.2.1-rc.5"
+  },
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg"
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "cordis.patch.yml",
+    "locale/*.json",
+    "icon.svg",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "test": "node test/smoke.mjs"
+  },
+  "peerDependencies": {
+    "react": ">=18.2.0"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": []
+    }
+  }
+}

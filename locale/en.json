@@ -1,6 +1,6 @@
 {
   "meta": {
     "title": "Update all",
-    "description": "Adds a sidebar entry next to the plugin market that updates the DSH desktop app and every installed plugin from the market in one click."
+    "description": "Adds a one-click \"lazy update\" sidebar entry: updates every installed plugin that has a newer version in one go, then hands off to the desktop app's built-in updater when an app update is available. No version checking or picking."
   }
 }

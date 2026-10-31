@@ -2,7 +2,7 @@
   "name": "dsh-one-click-update",
   "version": "0.1.0",
   "type": "module",
-  "description": "One-click update entry for the DSH desktop app: updates the app itself and every installed plugin-market plugin from the Harness Web UI sidebar.",
+  "description": "One-click, zero-effort updates for the DSH desktop app: update all the plugins and the app itself from a single sidebar entry.",
   "license": "MIT",
   "author": "Jared Wang",
   "repository": {

@@ -4,9 +4,9 @@
 [![license: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![npm](https://img.shields.io/npm/v/dsh-one-click-update.svg)](https://www.npmjs.com/package/dsh-one-click-update)
 
-> DSH 桌面端的「一键更新」入口：在 Harness Web UI 侧边栏点一下，就把 **DSH 桌面 App** 和**插件市场里所有已安装且可更新的插件**一起更新到最新版本。
+> DSH 桌面端的「一键懒人更新」入口：在 Harness Web UI 侧边栏点一下，就把**插件市场里所有已安装且可更新的插件**依次更新到位；**DSH 桌面 App** 有更新时接着打开它自带的更新流程——不用自己查版本、勾选条目，全程有进度。
 
-A one-click update entry for the [DSH](https://github.com/deepseek-ai/deepseek-harness) desktop app. It adds a sidebar row (next to 插件 / 插件市场 / 自动化任务) that opens a page which, by itself, updates every upgradable plugin installed from the plugin market and then updates the desktop app itself through the official `window.dshDesktop.updates` bridge. Progress is shown live per plugin and for the app download/install.
+A one-click, zero-effort updater for the [DSH](https://github.com/deepseek-ai/deepseek-harness) desktop app. It adds a sidebar row (next to 插件 / 插件市场 / 自动化任务) that opens a page which then does the rest: every upgradable plugin installed from the plugin market is updated in series with live per-item progress, and when the desktop app itself has an update, the entry hands off to the official `window.dshDesktop.updates` flow. No version checking, no picking items — one click, then let it run.
 
 ## 它做什么
 

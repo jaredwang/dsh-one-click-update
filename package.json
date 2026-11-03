@@ -1,8 +1,8 @@
 {
   "name": "dsh-one-click-update",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "type": "module",
-  "description": "One-click, zero-effort updates for the DSH desktop app: update all the plugins and the app itself from a single sidebar entry.",
+  "description": "One-click, zero-effort updates for the DSH desktop app: update all plugins and the app from a single sidebar entry, wait out maturity holds, and restart DSH in place.",
   "license": "MIT",
   "author": "Jared Wang",
   "repository": {
@@ -40,10 +40,11 @@
     "icon.svg",
     "README.md",
     "LICENSE",
-    "test/smoke.mjs"
+    "test/smoke.mjs",
+    "test/host.mjs"
   ],
   "scripts": {
-    "test": "node test/smoke.mjs"
+    "test": "node test/smoke.mjs && node test/host.mjs"
   },
   "dsh": {
     "bundle": {

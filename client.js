@@ -26,6 +26,8 @@ window.__ModuleLoader__.load({
 		const PANEL_ID = "one-click-update";
 		const STYLE_ID = "dsh-one-click-update-style";
 		const API = "/dsh-market/api/v1";
+		/** Host route of this bundle: restarts the desktop app (see index.js). */
+		const RESTART_API = "/dsh-one-click-update/restart";
 
 		/** App phases during which a second run must not start. */
 		const BUSY_PHASES = { downloading: true, verifying: true, installing: true };
@@ -57,11 +59,23 @@ window.__ModuleLoader__.load({
 				"plugins.failed": "失败：{reason}",
 				"plugins.cancelled": "已取消",
 				"plugins.rolled": "已回滚",
-				"plugins.restart": "有插件需要重启 DSH 桌面 App 后生效",
+				"plugins.restart": "插件已更新，需要重启 DSH 后生效（未重启时新建会话可能出错）。",
+				"plugins.restartTitle": "需要重启 DSH",
 				"plugins.action": "全部更新",
 				"plugins.retry": "重试失败项",
 				"plugins.recheck": "重新检查",
 				"plugins.busy": "更新中…",
+				"plugins.pendingHold": "等待成熟期（发布满期限后可更新）",
+				"plugins.donePending": "插件更新完成，{pending} 个等待成熟期",
+				"plugins.doneMixed": "插件更新完成，{failed} 个失败，{pending} 个等待成熟期",
+				"plugins.restartNow": "立即重启 DSH",
+				"plugins.restarting": "正在重启 DSH…",
+				"plugins.restartFailed": "重启失败：{reason}",
+				"plugins.restartManual": "未能自动重启，请手动重启 DSH。",
+				"plugins.restartStale": "重启接口尚未加载：请先手动退出并重新打开 DSH 桌面 App 一次，之后就能一键重启。",
+				"plugins.refreshHint": "插件已更新，刷新页面后即可新建会话。",
+				"plugins.refreshNow": "刷新页面",
+				"plugins.refreshing": "正在刷新页面…",
 
 				"app.unsupported": "更新 DSH 桌面 App 仅在桌面 App 内可用",
 				"app.action": "检查并更新",
@@ -112,11 +126,23 @@ window.__ModuleLoader__.load({
 				"plugins.failed": "Failed: {reason}",
 				"plugins.cancelled": "Cancelled",
 				"plugins.rolled": "Rolled back",
-				"plugins.restart": "Some plugins take effect after restarting the DSH desktop app",
+				"plugins.restart": "Plugins updated. Restart DSH to apply them (a new session may fail until then).",
+				"plugins.restartTitle": "DSH restart required",
 				"plugins.action": "Update all",
 				"plugins.retry": "Retry failed",
 				"plugins.recheck": "Check again",
 				"plugins.busy": "Updating…",
+				"plugins.pendingHold": "Waiting for the maturity hold to clear",
+				"plugins.donePending": "Plugins updated, {pending} waiting for maturity",
+				"plugins.doneMixed": "Plugins updated, {failed} failed, {pending} waiting for maturity",
+				"plugins.restartNow": "Restart DSH now",
+				"plugins.restarting": "Restarting DSH…",
+				"plugins.restartFailed": "Restart failed: {reason}",
+				"plugins.restartManual": "Could not restart automatically. Please restart DSH manually.",
+				"plugins.restartStale": "The restart endpoint is not loaded yet: quit and reopen the DSH desktop app once, and one-click restart will work from then on.",
+				"plugins.refreshHint": "Plugins updated. Refresh this page before opening a new session.",
+				"plugins.refreshNow": "Refresh page",
+				"plugins.refreshing": "Refreshing…",
 
 				"app.unsupported": "Updating the DSH desktop app is only available inside the desktop app",
 				"app.action": "Check and update",
@@ -246,7 +272,16 @@ window.__ModuleLoader__.load({
 				current: void 0,
 				results: {},
 				percent: void 0,
-				restartRequired: false
+				restartRequired: false,
+				/** The page itself is stale: refresh it before opening a new session. */
+				refreshRequired: false,
+				/** A page reload was scheduled/showed to apply the new client modules. */
+				refreshing: false,
+				/** A restart was requested and the shell has not died yet. */
+				restarting: false,
+				restartError: void 0,
+				/** "desktop" (host helper) | "market" (market restart endpoint) */
+				restartMode: void 0
 			}
 		};
 		const listeners = new Set();
@@ -374,7 +409,10 @@ window.__ModuleLoader__.load({
 		/** Read the market's capability document (features, restart support). */
 		async function loadCapabilities() {
 			const res = await apiGet(API + "/capabilities");
-			if (res.status === 200 && res.body && res.body.schema) patchMarket({ capabilities: res.body });
+			if (res.status === 200 && res.body && res.body.schema) {
+				patchMarket({ capabilities: res.body });
+				restoreRestart();
+			}
 		}
 
 		/** Ask the market which installed plugins can be updated. */
@@ -399,6 +437,53 @@ window.__ModuleLoader__.load({
 				packages,
 				error: void 0
 			});
+		}
+
+		/** One automatic page refresh per run, after plugins that need no restart. */
+		let autoRefreshStarted = false;
+
+		/**
+		 * The market refuses to hand out a release that is still inside the
+		 * desktop maturity hold. Depending on the path, that refusal reaches us as
+		 * RELEASE_TOO_FRESH, as a generic 409 (OPERATION_BUSY) or as a plain
+		 * message, so both the code and the sentence are recognised. It is not a
+		 * failure: the package simply waits until the hold clears.
+		 */
+		const HOLD_TEXT = /等待期|成熟期|发布太新|release.?age|release is held|still in (its )?waiting period|maturity hold/i;
+
+		function maturityHold(code, message) {
+			if (code === "RELEASE_TOO_FRESH") return true;
+			return typeof message === "string" && HOLD_TEXT.test(message);
+		}
+
+		/** Map a non-202 update response onto a row result. */
+		function outcomeOf(res) {
+			const body = res.body !== null && typeof res.body === "object" ? res.body : void 0;
+			const failure = body !== void 0 && body.failure !== null && typeof body.failure === "object" ? body.failure : void 0;
+			const code = failure !== void 0 && typeof failure.code === "string"
+				? failure.code
+				: body !== void 0 && body.stale === true && body.staleReason === "release-age"
+					? "RELEASE_TOO_FRESH"
+					: void 0;
+			const error = (failure !== void 0 && (failure.message || failure.code)) || (body !== void 0 && body.error) || res.error || "HTTP " + res.status;
+			if (maturityHold(code, error)) return { status: "pending", code: "RELEASE_TOO_FRESH", error };
+			return {
+				status: "failed",
+				error,
+				code,
+				retryable: failure !== void 0 ? failure.retryable === true : res.status !== 409
+			};
+		}
+
+		/** True when a 409 response is the maturity hold instead of a busy lock. */
+		function isHeld(res) {
+			const body = res.body !== null && typeof res.body === "object" ? res.body : void 0;
+			if (body === void 0) return false;
+			const failure = body.failure !== null && typeof body.failure === "object" ? body.failure : void 0;
+			const code = failure !== void 0 ? failure.code : void 0;
+			const message = failure !== void 0 ? failure.message : body.error;
+			if (maturityHold(code, message)) return true;
+			return body.stale === true && body.staleReason === "release-age";
 		}
 
 		/** Poll one market operation until it reaches a terminal state. */
@@ -426,42 +511,46 @@ window.__ModuleLoader__.load({
 				}
 				if (TERMINAL_STATES[operation.state] === true) {
 					if (operation.state === "succeeded") {
+						const restartRequired = operation.restartRequired === true;
 						return {
 							status: "done",
 							installedVersion: operation.installedVersion ?? operation.afterVersion,
-							restartRequired: operation.restartRequired === true || operation.refreshRequired === true
+							restartRequired,
+							refreshRequired: restartRequired !== true && (operation.refreshRequired === true || operation.hot === true)
 						};
 					}
 					const failure = operation.failure;
+					const code = failure !== void 0 && failure !== null ? failure.code : void 0;
+					const error = (failure && (failure.message || failure.code)) || operation.error || operation.state;
+					if (maturityHold(code, error)) return { status: "pending", code: "RELEASE_TOO_FRESH", error };
 					return {
 						status: operation.state === "cancelled" ? "cancelled" : operation.state === "rolled-back" ? "rolled" : "failed",
-						error: (failure && (failure.message || failure.code)) || operation.error || operation.state,
-						code: failure && failure.code,
-						retryable: failure && failure.retryable === true
+						error,
+						code,
+						retryable: failure !== void 0 && failure !== null && failure.retryable === true
 					};
 				}
 				if (Date.now() > deadline) return { status: "failed", error: "timeout" };
 			}
 		}
 
-		/** Update one plugin through the market API. */
+		/**
+		 * Update one plugin through the market API. A 409 usually means the market
+		 * is still busy with another operation, so it is retried — except when the
+		 * 409 carries the maturity hold, which no retry can clear.
+		 */
 		async function updateOne(pkg) {
-			let res = await apiPost(API + "/updates", { packageName: pkg.name });
 			let attempts = 0;
-			while (res.status === 409 && attempts < 6) {
-				await sleep(1500);
+			for (;;) {
+				const res = await apiPost(API + "/updates", { packageName: pkg.name });
+				if (res.status === 202 && res.body && res.body.operation) {
+					return await pollOperation(res.body.operation.operationId, pkg.name);
+				}
+				const outcome = outcomeOf(res);
+				if (outcome.status === "pending" || isHeld(res) || res.status !== 409 || attempts >= 6) return outcome;
 				attempts += 1;
-				res = await apiPost(API + "/updates", { packageName: pkg.name });
+				await sleep(1500);
 			}
-			if (res.status === 202 && res.body && res.body.operation) {
-				return await pollOperation(res.body.operation.operationId, pkg.name);
-			}
-			const failure = res.body && (res.body.failure ? res.body.failure.message || res.body.failure.code : res.body.error);
-			return {
-				status: "failed",
-				error: failure || res.error || "HTTP " + res.status,
-				code: res.body && res.body.failure && res.body.failure.code
-			};
 		}
 
 		/** Update plugins one at a time, keeping the visible list in sync. */
@@ -487,7 +576,8 @@ window.__ModuleLoader__.load({
 			const results = { ...state.market.results };
 			for (const pkg of ordered) delete results[pkg.name];
 			let restartRequired = state.market.restartRequired === true;
-			patchMarket({ running: true, finished: false, current: ordered[0].name, results, percent: 0, restartRequired: false });
+			let refreshRequired = false;
+			patchMarket({ running: true, finished: false, current: ordered[0].name, results, percent: 0, restartRequired: false, refreshRequired: false });
 			for (const pkg of ordered) {
 				patchMarket({ current: pkg.name, percent: 0 });
 				let outcome;
@@ -498,6 +588,7 @@ window.__ModuleLoader__.load({
 				}
 				results[pkg.name] = outcome;
 				if (outcome.restartRequired === true) restartRequired = true;
+				if (outcome.refreshRequired === true) refreshRequired = true;
 				patchMarket({ results: { ...results }, percent: 0 });
 			}
 			const packages = state.market.packages.map((pkg) => {
@@ -513,9 +604,185 @@ window.__ModuleLoader__.load({
 				current: void 0,
 				percent: void 0,
 				restartRequired,
+				refreshRequired,
 				packages,
 				updatable: remaining.length
 			});
+			rememberRestart(restartRequired === true);
+		}
+
+		/* ---------------------------------------------------------------- */
+		/* Applying updates: refresh the page, or restart the app             */
+		/* ---------------------------------------------------------------- */
+
+		const REFRESH_STAMP = "dsh-one-click-update:refreshed-at";
+
+		/** The window, when the client runs in a real browser page. */
+		function pageWindow() {
+			return typeof window === "object" && window !== null ? window : void 0;
+		}
+
+		/** Reload the page (the client modules of a fresh release are picked up). */
+		function refreshPage() {
+			const where = pageWindow();
+			if (where === void 0 || where.location === void 0 || typeof where.location.reload !== "function") return false;
+			where.location.reload();
+			return true;
+		}
+
+		/**
+		 * A plugin update changes the Host release, and a page keeps serving the
+		 * client modules it booted with until it reloads — that skew is the reason
+		 * 「新会话」 can fail right after an update. Reload once when the run ends;
+		 * the sessionStorage stamp stops a stale market summary from looping it.
+		 */
+		function scheduleRefresh(delay) {
+			const where = pageWindow();
+			if (where === void 0 || where.location === void 0 || typeof where.location.reload !== "function") return false;
+			let storage;
+			try {
+				storage = where.sessionStorage;
+			} catch (error) {
+				storage = void 0;
+			}
+			if (storage !== void 0 && storage !== null) {
+				try {
+					const last = Number(storage.getItem(REFRESH_STAMP) || "0");
+					if (Number.isFinite(last) && Date.now() - last < 120000) return false;
+					storage.setItem(REFRESH_STAMP, String(Date.now()));
+				} catch (error) {
+					return false;
+				}
+			}
+			patchMarket({ refreshing: true });
+			setTimeout(() => {
+				try {
+					where.location.reload();
+				} catch (error) {
+					/* the shell may have replaced the page already */
+				}
+			}, typeof delay === "number" ? delay : 1400);
+			return true;
+		}
+
+		/**
+		 * A Host-half update only takes effect after a full restart, and the page
+		 * learns that from one operation that lives in the Host process — a reload
+		 * would lose it. Keep the reminder in localStorage, keyed by the Host
+		 * bootId, so it survives reloads and disappears by itself once the Host
+		 * really rebooted.
+		 */
+		const RESTART_STAMP = "dsh-one-click-update:restart-pending";
+
+		function localStore() {
+			const where = pageWindow();
+			if (where === void 0) return void 0;
+			try {
+				return where.localStorage;
+			} catch (error) {
+				return void 0;
+			}
+		}
+
+		function rememberRestart(pending) {
+			const storage = localStore();
+			if (storage === void 0 || storage === null) return;
+			try {
+				if (!pending) {
+					storage.removeItem(RESTART_STAMP);
+					return;
+				}
+				const caps = state.market.capabilities;
+				const bootId = caps !== void 0 && caps.bootId !== void 0 ? String(caps.bootId) : null;
+				storage.setItem(RESTART_STAMP, JSON.stringify({ bootId, at: Date.now() }));
+			} catch (error) {
+				/* a storage-less shell just loses the reminder */
+			}
+		}
+
+		function restoreRestart() {
+			const storage = localStore();
+			if (storage === void 0 || storage === null) return;
+			let raw;
+			try {
+				raw = storage.getItem(RESTART_STAMP);
+			} catch (error) {
+				return;
+			}
+			if (raw === null || raw === void 0) return;
+			let saved;
+			try {
+				saved = JSON.parse(raw);
+			} catch (error) {
+				saved = null;
+			}
+			const caps = state.market.capabilities;
+			const bootId = caps !== void 0 && caps.bootId !== void 0 ? String(caps.bootId) : void 0;
+			const same = saved !== null && typeof saved === "object" && typeof saved.bootId === "string" && bootId !== void 0 && saved.bootId === bootId;
+			if (same) {
+				patchMarket({ restartRequired: true });
+				return;
+			}
+			try {
+				storage.removeItem(RESTART_STAMP);
+			} catch (error) {
+				/* ignore */
+			}
+		}
+
+		/**
+		 * One-click restart of the whole app. Desktop asks this bundle's Host route
+		 * (the shell exposes no restart call); a plain web Host uses the market's
+		 * own restart endpoint, and the page reloads once the Host answers again.
+		 */
+		async function restartDsh() {
+			if (state.market.restarting === true) return;
+			patchMarket({ restarting: true, restartError: void 0 });
+			const caps = state.market.capabilities;
+			const desktop = caps !== void 0 && caps.runtime === "desktop";
+			const marketRestart = caps !== void 0 && caps.restart !== void 0 && caps.restart.supported === true;
+			const attempts = [];
+			if (desktop) attempts.push({ url: RESTART_API, mode: "desktop" });
+			else {
+				if (marketRestart) attempts.push({ url: API + "/restart", mode: "market" });
+				attempts.push({ url: RESTART_API, mode: "desktop" });
+			}
+			let lastError;
+			for (const attempt of attempts) {
+				const res = await apiPost(attempt.url, {});
+				if (res.status >= 200 && res.status < 300) {
+					patchMarket({ restarting: true, restartMode: attempt.mode, restartError: void 0 });
+					if (attempt.mode === "market") void watchRestart();
+					else watchDesktopRestart();
+					return;
+				}
+				const body = res.body !== null && typeof res.body === "object" ? res.body : void 0;
+				lastError = res.status === 404 ? "stale" : (body !== void 0 && body.error) || res.error || "HTTP " + res.status;
+			}
+			patchMarket({ restarting: false, restartError: lastError === void 0 ? "manual" : lastError });
+		}
+
+		/** Desktop: if the page is still alive after a while, the quit was refused. */
+		function watchDesktopRestart() {
+			setTimeout(() => {
+				if (state.market.restarting !== true) return;
+				patchMarket({ restarting: false, restartError: "manual" });
+			}, 30000);
+		}
+
+		/** Web: wait for the restarted Host, then reload onto the new release. */
+		async function watchRestart() {
+			const deadline = Date.now() + 60000;
+			for (;;) {
+				await sleep(1200);
+				const res = await apiGet(API + "/capabilities");
+				if (res.status === 200) break;
+				if (Date.now() > deadline) {
+					patchMarket({ restarting: false, restartError: "manual" });
+					return;
+				}
+			}
+			scheduleRefresh(800);
 		}
 
 		/** Subscribe a component to the shared state. */
@@ -583,11 +850,17 @@ window.__ModuleLoader__.load({
 			if (market.status === "unsupported") return t("plugins.unsupported");
 			if (market.status === "error") return t("plugins.error", { reason: market.error === void 0 ? "?" : market.error });
 			if (market.status === "unknown" || market.status === "checking") return t("plugins.checking");
+			if (market.restarting === true) return t("plugins.restarting");
+			if (market.refreshing === true) return t("plugins.refreshing");
 			if (market.finished) {
 				const results = Object.values(market.results);
 				if (results.length === 0) return t("plugins.none");
 				const failed = results.filter((result) => result.status === "failed").length;
-				return failed > 0 ? t("plugins.doneSome", { failed }) : t("plugins.done");
+				const pending = results.filter((result) => result.status === "pending").length;
+				if (failed > 0 && pending > 0) return t("plugins.doneMixed", { failed, pending });
+				if (failed > 0) return t("plugins.doneSome", { failed });
+				if (pending > 0) return t("plugins.donePending", { pending });
+				return t("plugins.done");
 			}
 			if (market.updatable > 0) return t("plugins.count", { count: market.updatable });
 			return t("plugins.none");
@@ -597,8 +870,9 @@ window.__ModuleLoader__.load({
 		function toneOf(snapshot) {
 			const app = snapshot.app;
 			const market = snapshot.market;
-			if (app.phase === "error" || market.status === "error") return "error";
-			if (market.running || app.pending || BUSY_PHASES[app.phase] === true) return "active";
+			if (app.phase === "error" || market.status === "error" || market.restartError !== void 0) return "error";
+			if (market.running || market.restarting === true || market.refreshing === true || app.pending || BUSY_PHASES[app.phase] === true) return "active";
+			if (market.restartRequired === true) return "available";
 			if (market.updatable > 0 || app.phase === "available" || app.phase === "ready") return "available";
 			return "idle";
 		}
@@ -606,7 +880,9 @@ window.__ModuleLoader__.load({
 		/** Tooltip of the sidebar entry. */
 		function entryTitle(snapshot, t) {
 			const parts = [];
-			if (snapshot.market.running) parts.push(describePlugins(snapshot.market, t));
+			if (snapshot.market.restartRequired === true) parts.push(t("plugins.restartTitle"));
+			else if (snapshot.market.finished === true && snapshot.market.status === "ready") parts.push(describePlugins(snapshot.market, t));
+			else if (snapshot.market.running) parts.push(describePlugins(snapshot.market, t));
 			else if (snapshot.market.status === "ready") {
 				parts.push(snapshot.market.updatable > 0 ? t("plugins.count", { count: snapshot.market.updatable }) : t("plugins.none"));
 			}
@@ -762,6 +1038,7 @@ window.__ModuleLoader__.load({
 					const result = market.results[pkg.name];
 					let stateText = t("plugins.pending");
 					let tone = "idle";
+					let stateTitle;
 					if (market.running && market.current === pkg.name && result === void 0) {
 						stateText = t("plugins.updating");
 						tone = "active";
@@ -772,8 +1049,15 @@ window.__ModuleLoader__.load({
 								version: result.installedVersion === void 0 ? pkg.latestVersion : result.installedVersion
 							});
 							tone = "done";
+						} else if (result.status === "pending") {
+							// The release is still inside the market's maturity hold:
+							// nothing to retry, it becomes installable on its own later.
+							stateText = t("plugins.pendingHold");
+							stateTitle = result.error;
+							tone = "pending";
 						} else if (result.status === "failed") {
 							stateText = t("plugins.failed", { reason: result.error === void 0 ? "?" : result.error });
+							stateTitle = result.error;
 							tone = "error";
 						} else if (result.status === "cancelled") {
 							stateText = t("plugins.cancelled");
@@ -798,7 +1082,7 @@ window.__ModuleLoader__.load({
 								h("span", { className: "dsh-ocu-version dsh-ocu-version-new" }, pkg.latestVersion)
 							)
 						),
-						h("span", { className: "dsh-ocu-row-state" }, tone === "active" ? Spinner() : null, h("span", null, stateText))
+						h("span", { className: "dsh-ocu-row-state", title: stateTitle }, tone === "active" ? Spinner() : null, h("span", null, stateText))
 					);
 				})
 			);
@@ -808,9 +1092,21 @@ window.__ModuleLoader__.load({
 			const market = props.market;
 			const t = props.t;
 			const busy = market.running;
-			const failedNames = Object.keys(market.results).filter((name) => market.results[name].status === "failed");
+			const results = Object.values(market.results);
+			const failedNames = Object.keys(market.results).filter((name) => {
+				const result = market.results[name];
+				return result.status === "failed" && result.retryable !== false;
+			});
+			const succeeded = results.filter((result) => result.status === "done").length;
 			const showRows = market.packages.length > 0 && market.status !== "unsupported";
-			const disabled = busy || market.status === "unsupported";
+			const restartNeeded = market.restartRequired === true;
+			// Any successful plugin update changes the client-module release the page
+			// booted from; until it reloads, creating a new session can mix modules of
+			// two versions. On desktop only a full restart clears the server half.
+			const refreshNeeded = market.finished && succeeded > 0 && !restartNeeded;
+			const restarting = market.restarting === true;
+			const refreshing = market.refreshing === true;
+			const disabled = busy || restarting || market.status === "unsupported";
 			let actionLabel = t("plugins.action");
 			let action = () => void runPluginUpdates(void 0);
 			if (busy) actionLabel = t("plugins.busy");
@@ -820,18 +1116,37 @@ window.__ModuleLoader__.load({
 			} else if (market.finished) {
 				actionLabel = t("plugins.recheck");
 				action = () => {
-					patchMarket({ finished: false, results: {}, restartRequired: false });
+					patchMarket({
+						finished: false,
+						results: {},
+						restartRequired: false,
+						refreshRequired: false,
+						restarting: false,
+						restartError: void 0,
+						refreshing: false
+					});
+					rememberRestart(false);
 					void checkPlugins(true);
 				};
 			}
+			const notes = [];
+			if (restartNeeded) notes.push(t("plugins.restart"));
+			else if (refreshNeeded) notes.push(t("plugins.refreshHint"));
+			if (market.restartError === "manual") notes.push(t("plugins.restartManual"));
+			else if (market.restartError === "stale") notes.push(t("plugins.restartStale"));
+			else if (market.restartError !== void 0) notes.push(t("plugins.restartFailed", { reason: market.restartError }));
 			const total = market.packages.length;
 			const done = Object.keys(market.results).length;
 			const overall = busy && total > 0
 				? ((done + (market.percent === void 0 ? 0 : market.percent) / 100) / total) * 100
 				: 0;
+			let tone = "idle";
+			if (market.status === "error" || market.restartError !== void 0) tone = "error";
+			else if (busy || restarting || refreshing) tone = "active";
+			else if (restartNeeded) tone = "warn";
 			return h(
 				"section",
-				{ className: "dsh-ocu-card", "data-tone": market.status === "error" ? "error" : busy ? "active" : "idle" },
+				{ className: "dsh-ocu-card", "data-tone": tone },
 				h(
 					"div",
 					{ className: "dsh-ocu-card-head" },
@@ -846,7 +1161,9 @@ window.__ModuleLoader__.load({
 				),
 				busy ? ProgressBar({ percent: overall }) : null,
 				showRows ? h(PluginRows, { market, t }) : null,
-				market.restartRequired && market.finished ? h("p", { className: "dsh-ocu-card-note dsh-ocu-note-warn" }, t("plugins.restart")) : null,
+				notes.length > 0
+					? h("p", { className: "dsh-ocu-card-note dsh-ocu-note-warn" }, notes.join(" "))
+					: null,
 				h(
 					"div",
 					{ className: "dsh-ocu-card-actions" },
@@ -858,10 +1175,37 @@ window.__ModuleLoader__.load({
 							onClick: action,
 							"data-busy": busy ? "true" : void 0,
 							"aria-disabled": disabled ? "true" : void 0,
-							disabled: market.status === "unsupported"
+							disabled: market.status === "unsupported" || restarting
 						},
 						actionLabel
-					)
+					),
+					restartNeeded
+						? h(
+							"button",
+							{
+								type: "button",
+								className: "dsh-ocu-primary dsh-ocu-primary-warn",
+								onClick: () => void restartDsh(),
+								"data-busy": restarting ? "true" : void 0,
+								"aria-disabled": restarting ? "true" : void 0,
+								disabled: restarting
+							},
+							restarting ? t("plugins.restarting") : t("plugins.restartNow")
+						)
+						: null,
+					refreshNeeded
+						? h(
+							"button",
+							{
+								type: "button",
+								className: "dsh-ocu-primary dsh-ocu-primary-quiet",
+								onClick: refreshPage,
+								"aria-disabled": refreshing ? "true" : void 0,
+								disabled: refreshing
+							},
+							refreshing ? t("plugins.refreshing") : t("plugins.refreshNow")
+						)
+						: null
 				)
 			);
 		}
@@ -942,6 +1286,23 @@ window.__ModuleLoader__.load({
 				})();
 			}, [market.status]);
 
+			// Once the run ends, the page is serving the previous client-module
+			// release. Reload it automatically when no restart is needed, so a new
+			// session can't mix two versions; a restart keeps the button instead.
+			React.useEffect(() => {
+				if (autoRefreshStarted) return;
+				if (!market.finished || market.running) return;
+				if (market.restartRequired === true) return;
+				// The app updater ends with its own restart (and owns a native
+				// window): don't race it with a page reload. The panel keeps the
+				// 「刷新页面」 button for the case where that update is declined.
+				const app = snapshot.app;
+				if (app.pending === true || BUSY_PHASES[app.phase] === true || app.phase === "available") return;
+				if (Object.values(market.results).every((result) => result.status !== "done")) return;
+				autoRefreshStarted = true;
+				scheduleRefresh();
+			}, [market.finished, market.running, market.restartRequired, snapshot.app.phase, snapshot.app.pending]);
+
 			return h(
 				"div",
 				{ className: "dsh-ocu-page" },
@@ -996,6 +1357,9 @@ window.__ModuleLoader__.load({
 			".dsh-ocu-row-state{display:inline-flex;align-items:center;gap:6px;color:var(--dsw-alias-label-secondary,#6b6b70);white-space:nowrap;max-width:52%;overflow:hidden;text-overflow:ellipsis}",
 			'.dsh-ocu-row[data-tone="error"] .dsh-ocu-row-state{color:var(--dsw-alias-state-error-primary,#d64545)}',
 			'.dsh-ocu-row[data-tone="done"] .dsh-ocu-row-state{color:var(--dsw-alias-state-success-primary,#2f9e5f)}',
+			'.dsh-ocu-row[data-tone="pending"] .dsh-ocu-row-state{color:var(--dsw-alias-state-warning-primary,#b07d1a)}',
+			'.dsh-ocu-card[data-tone="warn"]{border-color:var(--dsw-alias-state-warning-primary,#b07d1a)}',
+			'.dsh-ocu-card[data-tone="warn"] .dsh-ocu-card-value{color:var(--dsw-alias-state-warning-primary,#b07d1a)}',
 			".dsh-ocu-card-note{margin:0;font-size:12px;line-height:1.6;color:var(--dsw-alias-label-secondary,#6b6b70)}",
 			".dsh-ocu-note-warn{color:var(--dsw-alias-state-warning-primary,#b07d1a)}",
 			".dsh-ocu-card-actions{display:flex;align-items:center;gap:10px;padding-top:2px}",
@@ -1003,6 +1367,8 @@ window.__ModuleLoader__.load({
 			".dsh-ocu-primary:hover{filter:brightness(1.06)}",
 			".dsh-ocu-primary:active{filter:brightness(.94)}",
 			'.dsh-ocu-primary[data-busy="true"]{opacity:.55;cursor:default}',
+			".dsh-ocu-primary:disabled{opacity:.55;cursor:default}",
+			".dsh-ocu-primary-warn{background:var(--dsw-alias-state-warning-primary,#b07d1a)}",
 			".dsh-ocu-primary-quiet{color:var(--dsw-alias-label-primary,#1c1c1e);background:var(--dsw-alias-interactive-bg-hover,rgba(0,0,0,.06))}",
 			".dsh-ocu-card-foot{margin:2px 0 0;font-size:12px;line-height:1.6;color:var(--dsw-alias-label-secondary,#6b6b70)}",
 			"@media (max-width:560px){.dsh-ocu-page{padding:24px 20px 36px}.dsh-ocu-row{flex-direction:column;align-items:flex-start;gap:4px}.dsh-ocu-row-state{max-width:100%}}",

@@ -171,7 +171,9 @@ function makeApi(options) {
 		summaryStatus: options.summaryStatus ?? 200,
 		packages: options.packages ?? [],
 		failNames: options.failNames ?? [],
+		holdNames: options.holdNames ?? [],
 		restartNames: options.restartNames ?? [],
+		restarts: [],
 		async fetch(url, init) {
 			const method = (init && init.method) || "GET";
 			const path = String(url);
@@ -180,6 +182,7 @@ function makeApi(options) {
 					schema: "dsh-market/update-api/v1",
 					apiVersion: 1,
 					runtime: "desktop",
+					bootId: options.bootId ?? "boot-1",
 					features: { check: true, update: true, progress: true, rollback: true, restart: false, updatesSummary: true },
 					restart: { supported: false, managedBy: "desktop-host" }
 				});
@@ -194,14 +197,30 @@ function makeApi(options) {
 				api.posted.push(name);
 				return resp(202, { operation: { operationId: "op-" + name } });
 			}
+			if (path === "/dsh-one-click-update/restart" && method === "POST") {
+				api.restarts.push(path);
+				return resp(202, { ok: true, helper: "/tmp/helper.sh", restart: { supported: true, mode: "osascript" } });
+			}
 			if (path.startsWith("/dsh-market/api/v1/operations?operationId=")) {
 				const id = decodeURIComponent(path.split("=")[1]);
 				const n = (api.polls[id] = (api.polls[id] || 0) + 1);
 				const name = id.slice(3);
 				if (n < 2) return resp(200, { operation: { operationId: id, state: "running", percent: 55 } });
+				if (api.holdNames.indexOf(name) !== -1) {
+					// What the market really answers for a maturity hold: a failed
+					// operation whose 409 body carried no `stale` flag, so the v1 API
+					// reports the generic busy code and the Chinese hold sentence.
+					return resp(200, {
+						operation: {
+							operationId: id,
+							state: "failed",
+							failure: { code: "OPERATION_BUSY", message: "当前最新版仍在等待期；请刷新市场以确认可安装的成熟版本。", retryable: true }
+						}
+					});
+				}
 				if (api.failNames.indexOf(name) !== -1) {
 					return resp(200, {
-						operation: { operationId: id, state: "failed", failure: { code: "RELEASE_TOO_FRESH", message: "发布太新", retryable: true } }
+						operation: { operationId: id, state: "failed", failure: { code: "AGENTS_RUNNING", message: "agents are running", retryable: true } }
 					});
 				}
 				return resp(200, {
@@ -233,10 +252,15 @@ function resp(status, body) {
 /* ------------------------------------------------------------------ */
 async function load(options) {
 	const document = makeDocument();
-	const localStorage = { data: new Map(), setItem(k, v) { this.data.set(k, v); }, getItem(k) { return this.data.get(k) ?? null; } };
+	const localStorage = { data: new Map(), setItem(k, v) { this.data.set(k, v); }, getItem(k) { return this.data.get(k) ?? null; }, removeItem(k) { this.data.delete(k); } };
+	for (const [key, value] of Object.entries(options.storage ?? {})) localStorage.data.set(key, value);
 	const api = makeApi(options);
+	const reloads = { count: 0 };
+	const sessionStorage = { data: new Map(), setItem(k, v) { this.data.set(k, v); }, getItem(k) { return this.data.get(k) ?? null; } };
 	const sandbox = {
 		document,
+		location: { reload() { reloads.count += 1; } },
+		sessionStorage,
 		localStorage,
 		fetch: (url, init) => api.fetch(url, init),
 		console,
@@ -309,7 +333,29 @@ async function load(options) {
 	if (options.bridge !== false) sandbox.window.dshDesktop = { updates: makeBridge(options.appPhase, options.statusDelay) };
 	mod.apply(ctx);
 	const t = ctx.locale.bind("dsh-one-click-update");
-	return { sandbox, api, mod, React, requires, dicts, registered, injectedKeys, document, t, sandboxDocument: document };
+	return { sandbox, api, mod, React, requires, dicts, registered, injectedKeys, document, t, reloads, sessionStorage, localStorage };
+}
+
+function textOf(node) {
+	if (node === null || node === undefined) return "";
+	if (typeof node === "string" || typeof node === "number") return String(node);
+	if (Array.isArray(node)) return node.map(textOf).join("");
+	if (typeof node !== "object") return "";
+	if (node.props && node.props.children !== undefined) return textOf(node.props.children);
+	return "";
+}
+function findButton(node, label) {
+	if (node === null || typeof node !== "object") return undefined;
+	if (Array.isArray(node)) {
+		for (const child of node) {
+			const hit = findButton(child, label);
+			if (hit !== undefined) return hit;
+		}
+		return undefined;
+	}
+	if (node.type === "button" && textOf(node).includes(label)) return node;
+	if (node.props && node.props.children !== undefined) return findButton(node.props.children, label);
+	return undefined;
 }
 
 /* ------------------------------------------------------------------ */
@@ -322,7 +368,7 @@ async function load(options) {
 			{ name: "alpha", source: "npm", installedVersion: "1.0.0", latestVersion: "1.1.0" },
 			{ name: "beta", source: "npm", installedVersion: "2.0.0", latestVersion: "2.1.0" }
 		],
-		failNames: ["beta"],
+		holdNames: ["beta"],
 		restartNames: ["alpha"]
 	});
 	ok("module id", env.sandbox.__loadedId === "dsh-one-click-update", env.sandbox.__loadedId);
@@ -362,11 +408,23 @@ async function load(options) {
 	const done = JSON.stringify(view.output);
 	ok("row shows versions", done.includes("1.1.0") && done.includes("\u2192"), done.slice(0, 1200));
 	ok("row shows installed", done.includes("已更新到 9.9.9"), done.slice(0, 1200));
-	ok("row shows failure message", done.includes("发布太新"), done.slice(0, 1600));
+	ok("row shows the maturity hold", done.includes("等待成熟期"), done.slice(0, 1600));
+	ok("held plugin is not retryable", !done.includes("重试失败项") && done.includes("重新检查"), done.slice(0, 1600));
 	ok("restart hint shown", done.includes("需要重启"), done.slice(0, 1600));
-	ok("retry label after failure", done.includes("重试失败项"), done.slice(0, 1600));
+	ok("restart button shown", done.includes("立即重启 DSH"), done.slice(0, 1600));
+	ok("restart required keeps the page alive", env.reloads.count === 0, env.reloads.count);
 	ok("app flow auto-started once", bridgeCalls.open === 1, bridgeCalls.open);
 	ok("app section present", done.includes("发现新版本"), done.slice(0, 2000));
+
+	const restartButton = findButton(view.output, "立即重启 DSH");
+	ok("restart button is clickable", !!restartButton, restartButton);
+	if (restartButton) {
+		await restartButton.props.onClick();
+		await sleep(60);
+		const restarting = JSON.stringify(view.output);
+		ok("restart posts to the plugin route", env.api.restarts.length === 1, JSON.stringify(env.api.restarts));
+		ok("restart status shown", restarting.includes("正在重启 DSH"), restarting.slice(0, 1400));
+	}
 	view.unmount();
 }
 
@@ -440,9 +498,111 @@ async function load(options) {
 }
 
 /* ------------------------------------------------------------------ */
+/* Scenario 6 — a transient failure is still retryable                 */
+/* ------------------------------------------------------------------ */
+{
+	const env = await load({
+		appPhase: "idle",
+		packages: [{ name: "beta", source: "npm", installedVersion: "2.0.0", latestVersion: "2.1.0" }],
+		failNames: ["beta"]
+	});
+	await sleep(80);
+	const page = env.registered.find((r) => r.options.name === "main");
+	const view = env.React.mount(page.component, { t: env.t });
+	await sleep(2600);
+	const text = JSON.stringify(view.output);
+	ok("transient failure keeps the retry action", text.includes("重试失败项"), text.slice(0, 1400));
+	ok("transient failure shows its message", text.includes("agents are running"), text.slice(0, 1400));
+	ok("a failed run does not reload the page", env.reloads.count === 0, env.reloads.count);
+	view.unmount();
+}
+
+/* ------------------------------------------------------------------ */
+/* Scenario 7 — only a held release: nothing to retry                  */
+/* ------------------------------------------------------------------ */
+{
+	const env = await load({
+		appPhase: "idle",
+		packages: [{ name: "gamma", source: "npm", installedVersion: "3.0.0", latestVersion: "3.1.0" }],
+		holdNames: ["gamma"]
+	});
+	await sleep(80);
+	const page = env.registered.find((r) => r.options.name === "main");
+	const view = env.React.mount(page.component, { t: env.t });
+	await sleep(2600);
+	const text = JSON.stringify(view.output);
+	ok("held-only run counts the hold", text.includes("1 个等待成熟期"), text.slice(0, 1400));
+	ok("held-only run offers no retry", !text.includes("重试失败项") && text.includes("重新检查"), text.slice(0, 1400));
+	ok("held-only run does not reload", env.reloads.count === 0, env.reloads.count);
+	ok("held row explains itself", text.includes("等待成熟期（发布满期限后可更新）"), text.slice(0, 1800));
+	view.unmount();
+}
+
+/* ------------------------------------------------------------------ */
+/* Scenario 8 — client-only update: the page reloads itself            */
+/* ------------------------------------------------------------------ */
+{
+	const env = await load({
+		appPhase: "idle",
+		packages: [{ name: "delta", source: "npm", installedVersion: "4.0.0", latestVersion: "4.1.0" }]
+	});
+	await sleep(80);
+	const page = env.registered.find((r) => r.options.name === "main");
+	const view = env.React.mount(page.component, { t: env.t });
+	await sleep(4200);
+	const text = JSON.stringify(view.output);
+	ok("client-only update reloads the page once", env.reloads.count === 1, env.reloads.count);
+	ok("client-only update explains the reload", text.includes("刷新页面后即可新建会话"), text.slice(0, 1400));
+	ok("reload is stamped to stop loops", env.sessionStorage.getItem("dsh-one-click-update:refreshed-at") !== null, [...env.sessionStorage.data.keys()]);
+	view.unmount();
+}
+
+/* ------------------------------------------------------------------ */
+/* Scenario 9 — a restart reminder survives a page reload              */
+/* ------------------------------------------------------------------ */
+{
+	const env = await load({
+		appPhase: "idle",
+		packages: [],
+		storage: { "dsh-one-click-update:restart-pending": JSON.stringify({ bootId: "boot-1", at: Date.now() }) }
+	});
+	await sleep(80);
+	const entry = env.registered.find((r) => r.options.name === "sidebar.panellist");
+	const page = env.registered.find((r) => r.options.name === "main");
+	const glyph = env.React.mount(entry.component, { t: env.t, size: 16 });
+	ok("restart reminder marks the glyph", glyph.output.props["data-tone"] === "available", glyph.output.props["data-tone"]);
+	ok("restart reminder changes the tooltip", String(glyph.output.props.title).includes("需要重启 DSH"), glyph.output.props.title);
+	glyph.unmount();
+	const view = env.React.mount(page.component, { t: env.t });
+	const text = JSON.stringify(view.output);
+	ok("restart reminder survives a reload", text.includes("需要重启 DSH 后生效"), text.slice(0, 1400));
+	ok("restart reminder keeps the button", text.includes("立即重启 DSH"), text.slice(0, 1400));
+	ok("restart reminder does not reload the page", env.reloads.count === 0, env.reloads.count);
+	view.unmount();
+}
+
+/* ------------------------------------------------------------------ */
+/* Scenario 10 — the Host did reboot, the stale reminder is dropped    */
+/* ------------------------------------------------------------------ */
+{
+	const env = await load({
+		appPhase: "idle",
+		packages: [],
+		storage: { "dsh-one-click-update:restart-pending": JSON.stringify({ bootId: "boot-old", at: Date.now() }) }
+	});
+	await sleep(80);
+	const page = env.registered.find((r) => r.options.name === "main");
+	const view = env.React.mount(page.component, { t: env.t });
+	const text = JSON.stringify(view.output);
+	ok("stale restart reminder is ignored", !text.includes("需要重启 DSH 后生效"), text.slice(0, 1400));
+	ok("stale restart reminder is erased", env.localStorage.getItem("dsh-one-click-update:restart-pending") === null, [...env.localStorage.data.keys()]);
+	view.unmount();
+}
+
+/* ------------------------------------------------------------------ */
 /* Probe leftovers                                                     */
 /* ------------------------------------------------------------------ */
-for (const marker of ["TEMP-PROBE", "ocu.probe", "localStorage.setItem", "__ocuCtx"]) {
+for (const marker of ["TEMP-PROBE", "ocu.probe", "__ocuCtx"]) {
 	ok("no leftover " + marker, !SRC.includes(marker));
 }
 

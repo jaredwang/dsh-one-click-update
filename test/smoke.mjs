@@ -173,7 +173,10 @@ function makeApi(options) {
 		failNames: options.failNames ?? [],
 		holdNames: options.holdNames ?? [],
 		restartNames: options.restartNames ?? [],
+		inUseNames: options.inUseNames ?? [],
 		restarts: [],
+		overlays: [],
+		overlayStatus: options.overlayStatus ?? 200,
 		async fetch(url, init) {
 			const method = (init && init.method) || "GET";
 			const path = String(url);
@@ -201,6 +204,17 @@ function makeApi(options) {
 				api.restarts.push(path);
 				return resp(202, { ok: true, helper: "/tmp/helper.sh", restart: { supported: true, mode: "osascript" } });
 			}
+			if (path === "/dsh-one-click-update/overlay" && method === "POST") {
+				const payload = JSON.parse(init.body);
+				api.overlays.push(payload);
+				if (api.overlayStatus === 501) {
+					return resp(501, {
+						error: "overlaying a plugin needs the desktop app's package manager",
+						hint: "restart DSH to load this route, or run pnpm add " + payload.name + "@" + payload.version
+					});
+				}
+				return resp(200, { ok: true, name: payload.name, version: payload.version, from: "0.28.2", restartRequired: true });
+			}
 			if (path.startsWith("/dsh-market/api/v1/operations?operationId=")) {
 				const id = decodeURIComponent(path.split("=")[1]);
 				const n = (api.polls[id] = (api.polls[id] || 0) + 1);
@@ -215,6 +229,22 @@ function makeApi(options) {
 							operationId: id,
 							state: "failed",
 							failure: { code: "OPERATION_BUSY", message: "当前最新版仍在等待期；请刷新市场以确认可安装的成熟版本。", retryable: true }
+						}
+					});
+				}
+				if (api.inUseNames.indexOf(name) !== -1) {
+					// What the market answers when the desktop app refuses to remove a
+					// mounted bundle: the failure code is exactly `bundle-in-use`.
+					return resp(200, {
+						operation: {
+							operationId: id,
+							state: "failed",
+							failure: {
+								code: "bundle-in-use",
+								message:
+									"这个插件正在使用中，桌面端不允许现在移除 / the plugin is in use, and the desktop app will not remove it right now (bundle-in-use)",
+								retryable: false
+							}
 						}
 					});
 				}
@@ -596,6 +626,60 @@ function findButton(node, label) {
 	const text = JSON.stringify(view.output);
 	ok("stale restart reminder is ignored", !text.includes("需要重启 DSH 后生效"), text.slice(0, 1400));
 	ok("stale restart reminder is erased", env.localStorage.getItem("dsh-one-click-update:restart-pending") === null, [...env.localStorage.data.keys()]);
+	view.unmount();
+}
+
+/* ------------------------------------------------------------------ */
+/* Scenario 11 — a mounted plugin is installed over instead of refused */
+/* ------------------------------------------------------------------ */
+{
+	const env = await load({
+		appPhase: "idle",
+		packages: [{ name: "dsh-better-sidebar", source: "npm", installedVersion: "0.28.2", latestVersion: "0.30.1" }],
+		inUseNames: ["dsh-better-sidebar"]
+	});
+	await sleep(80);
+	const page = env.registered.find((r) => r.options.name === "main");
+	const view = env.React.mount(page.component, { t: env.t });
+	await sleep(2600);
+	const text = JSON.stringify(view.output);
+	ok("in-use plugin tries the market first", JSON.stringify(env.api.posted) === '["dsh-better-sidebar"]', JSON.stringify(env.api.posted));
+	ok(
+		"in-use plugin falls back to the overlay route",
+		env.api.overlays.length === 1 && env.api.overlays[0].name === "dsh-better-sidebar" && env.api.overlays[0].version === "0.30.1",
+		JSON.stringify(env.api.overlays)
+	);
+	ok("overlay install counts as updated", text.includes("已覆盖安装 0.30.1，重启后生效"), text.slice(0, 1600));
+	ok("overlay install explains the restart", text.includes("需要重启") && text.includes("立即重启 DSH"), text.slice(0, 1600));
+	ok("overlay install is summarized", text.includes("插件更新完成") && text.includes("1 个已更新"), text.slice(0, 1600));
+	ok("overlay install is not retryable", !text.includes("重试失败项"), text.slice(0, 1600));
+	ok("overlay install keeps the page alive", env.reloads.count === 0, env.reloads.count);
+	view.unmount();
+}
+
+/* ------------------------------------------------------------------ */
+/* Scenario 12 — no overlay route: the in-use plugin stays blocked     */
+/* ------------------------------------------------------------------ */
+{
+	const env = await load({
+		appPhase: "idle",
+		packages: [{ name: "dsh-better-sidebar", source: "npm", installedVersion: "0.28.2", latestVersion: "0.30.1" }],
+		inUseNames: ["dsh-better-sidebar"],
+		overlayStatus: 501
+	});
+	await sleep(80);
+	const page = env.registered.find((r) => r.options.name === "main");
+	const view = env.React.mount(page.component, { t: env.t });
+	await sleep(2600);
+	const text = JSON.stringify(view.output);
+	ok("missing overlay route is reported", env.api.overlays.length === 1, JSON.stringify(env.api.overlays));
+	ok("blocked plugin says it is in use", text.includes("正在使用中，需重启后更新"), text.slice(0, 1600));
+	ok("blocked plugin carries the hint", text.includes("pnpm add dsh-better-sidebar@0.30.1"), text.slice(0, 1600));
+	ok("blocked plugin explains the restart", text.includes("当前 Host 还不支持覆盖安装") && text.includes("重启 DSH"), text.slice(0, 1600));
+	ok("blocked plugin offers the restart", text.includes("立即重启 DSH"), text.slice(0, 1600));
+	ok("blocked plugin is summarized", text.includes("1 个需重启后更新"), text.slice(0, 1600));
+	ok("blocked plugin is not retried as a failure", !text.includes("重试失败项"), text.slice(0, 1600));
+	ok("blocked plugin does not reload the page", env.reloads.count === 0, env.reloads.count);
 	view.unmount();
 }
 

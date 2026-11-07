@@ -1,6 +1,6 @@
 {
   "meta": {
     "title": "Update all",
-    "description": "Adds a one-click \"lazy update\" sidebar entry: updates every installed plugin that has a newer version in one go, shows plugins that are still inside the release maturity hold as waiting instead of retryable failures, reloads the page after client-only updates so a new session cannot hit two module versions, offers a one-click DSH restart when the Host half changed, and hands off to the desktop app's built-in updater when an app update is available."
+    "description": "Adds a one-click \"lazy update\" sidebar entry: updates every installed plugin that has a newer version in one go, shows plugins that are still inside the release maturity hold as waiting instead of retryable failures, installs over plugins the desktop app refuses to hot-remove and asks for a restart to apply them, reloads the page after client-only updates so a new session cannot hit two module versions, offers a one-click DSH restart when the Host half changed, and hands off to the desktop app's built-in updater when an app update is available."
   }
 }

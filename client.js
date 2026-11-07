@@ -28,6 +28,8 @@ window.__ModuleLoader__.load({
 		const API = "/dsh-market/api/v1";
 		/** Host route of this bundle: restarts the desktop app (see index.js). */
 		const RESTART_API = "/dsh-one-click-update/restart";
+		/** Host route of this bundle: installs over a mounted bundle (see index.js). */
+		const OVERLAY_API = "/dsh-one-click-update/overlay";
 
 		/** App phases during which a second run must not start. */
 		const BUSY_PHASES = { downloading: true, verifying: true, installing: true };
@@ -59,6 +61,17 @@ window.__ModuleLoader__.load({
 				"plugins.failed": "失败：{reason}",
 				"plugins.cancelled": "已取消",
 				"plugins.rolled": "已回滚",
+				"plugins.blocked": "正在使用中，需重启后更新",
+				"plugins.blockedNote": "有插件正在使用中，桌面端不允许热移除，覆盖安装也未完成；可重启 DSH 后再试。",
+				"plugins.overlayWorking": "无法热更新，正在覆盖安装…",
+				"plugins.overlayDone": "已覆盖安装 {version}，重启后生效",
+				"plugins.overlayUnavailable": "此插件正在使用中，当前 Host 还不支持覆盖安装；重启 DSH 后重新打开本页，就会自动覆盖安装。",
+				"plugins.summary": "插件更新完成：{parts}",
+				"plugins.sumJoin": "，",
+				"plugins.sumDone": "{count} 个已更新",
+				"plugins.sumFailed": "{count} 个失败",
+				"plugins.sumPending": "{count} 个等待成熟期",
+				"plugins.sumBlocked": "{count} 个需重启后更新",
 				"plugins.restart": "插件已更新，需要重启 DSH 后生效（未重启时新建会话可能出错）。",
 				"plugins.restartTitle": "需要重启 DSH",
 				"plugins.action": "全部更新",
@@ -126,6 +139,17 @@ window.__ModuleLoader__.load({
 				"plugins.failed": "Failed: {reason}",
 				"plugins.cancelled": "Cancelled",
 				"plugins.rolled": "Rolled back",
+				"plugins.blocked": "In use — needs a restart",
+				"plugins.blockedNote": "A plugin is in use, so the desktop app will not remove it while it runs, and the install over it did not finish. Restart DSH and try again.",
+				"plugins.overlayWorking": "Cannot hot-update; installing over it…",
+				"plugins.overlayDone": "Installed over {version} — restart to apply",
+				"plugins.overlayUnavailable": "This plugin is in use and this Host cannot install over it yet. Restart DSH, then reopen this page and it will install over it automatically.",
+				"plugins.summary": "Plugins updated: {parts}",
+				"plugins.sumJoin": ", ",
+				"plugins.sumDone": "{count} updated",
+				"plugins.sumFailed": "{count} failed",
+				"plugins.sumPending": "{count} waiting for maturity",
+				"plugins.sumBlocked": "{count} need a restart",
 				"plugins.restart": "Plugins updated. Restart DSH to apply them (a new session may fail until then).",
 				"plugins.restartTitle": "DSH restart required",
 				"plugins.action": "Update all",
@@ -270,6 +294,8 @@ window.__ModuleLoader__.load({
 				running: false,
 				finished: false,
 				current: void 0,
+				/** The plugin the Host is currently installing over (see OVERLAY_API). */
+				overlay: void 0,
 				results: {},
 				percent: void 0,
 				restartRequired: false,
@@ -486,6 +512,73 @@ window.__ModuleLoader__.load({
 			return body.stale === true && body.staleReason === "release-age";
 		}
 
+		/**
+		 * The desktop app refuses to remove a bundle whose loader entry is still
+		 * live ("bundle-in-use"), and the market's managed update is
+		 * remove-then-install, so a mounted plugin can never be hot-updated — the
+		 * button would show the same bilingual refusal on every click. Such a
+		 * plugin is installed over instead: the running copy stays loaded, the new
+		 * files land on disk, and the restart the page already offers applies it.
+		 */
+		const IN_USE_CODES = { "bundle-in-use": true, "stop-profile": true, "not-removable": true };
+		const IN_USE_TEXT = /bundle-in-use|this plugin is in use|will not remove it|正在使用中|不允许现在移除/i;
+
+		function inUseFailure(code, message) {
+			if (typeof code === "string" && IN_USE_CODES[code] === true) return true;
+			return typeof message === "string" && IN_USE_TEXT.test(message);
+		}
+
+		/** Install the target version over the running one through the Host half. */
+		async function overlayUpdate(pkg) {
+			let res;
+			try {
+				res = await apiPost(OVERLAY_API, { name: pkg.name, version: pkg.latestVersion });
+			} catch (error) {
+				return {
+					status: "blocked",
+					code: "overlay-failed",
+					error: error instanceof Error ? error.message : String(error)
+				};
+			}
+			const body = res.body !== null && typeof res.body === "object" ? res.body : {};
+			if (res.status === 200 && body.ok === true) {
+				return {
+					status: "done",
+					overlaid: true,
+					installedVersion: typeof body.version === "string" ? body.version : pkg.latestVersion,
+					restartRequired: true,
+					refreshRequired: false
+				};
+			}
+			if (maturityHold(body.code, body.error)) return { status: "pending", code: "RELEASE_TOO_FRESH", error: body.error };
+			if (res.status === 404 || res.status === 501) {
+				return {
+					status: "blocked",
+					code: "overlay-unavailable",
+					error: typeof body.hint === "string" ? body.hint : body.error
+				};
+			}
+			return {
+				status: "blocked",
+				code: typeof body.code === "string" ? body.code : "overlay-failed",
+				error: body.error || "HTTP " + res.status
+			};
+		}
+
+		/**
+		 * A market update that failed because the plugin is mounted falls back to
+		 * the overlay install. Anything else keeps its own outcome.
+		 */
+		async function recoverInUse(pkg, outcome) {
+			if (outcome.status !== "failed" || inUseFailure(outcome.code, outcome.error) !== true) return outcome;
+			patchMarket({ overlay: pkg.name });
+			try {
+				return await overlayUpdate(pkg);
+			} finally {
+				patchMarket({ overlay: void 0 });
+			}
+		}
+
 		/** Poll one market operation until it reaches a terminal state. */
 		async function pollOperation(operationId, name) {
 			const deadline = Date.now() + 8 * 60 * 1000;
@@ -544,10 +637,12 @@ window.__ModuleLoader__.load({
 			for (;;) {
 				const res = await apiPost(API + "/updates", { packageName: pkg.name });
 				if (res.status === 202 && res.body && res.body.operation) {
-					return await pollOperation(res.body.operation.operationId, pkg.name);
+					return await recoverInUse(pkg, await pollOperation(res.body.operation.operationId, pkg.name));
 				}
 				const outcome = outcomeOf(res);
-				if (outcome.status === "pending" || isHeld(res) || res.status !== 409 || attempts >= 6) return outcome;
+				if (outcome.status === "pending" || isHeld(res) || res.status !== 409 || attempts >= 6) {
+					return await recoverInUse(pkg, outcome);
+				}
 				attempts += 1;
 				await sleep(1500);
 			}
@@ -857,6 +952,18 @@ window.__ModuleLoader__.load({
 				if (results.length === 0) return t("plugins.none");
 				const failed = results.filter((result) => result.status === "failed").length;
 				const pending = results.filter((result) => result.status === "pending").length;
+				const blocked = results.filter((result) => result.status === "blocked").length;
+				// An overlay install is a success that leaves the app restart-pending,
+				// so the plain "done" sentences would read wrong; compose instead.
+				if (blocked > 0 || results.some((result) => result.overlaid === true)) {
+					const done = results.filter((result) => result.status === "done").length;
+					const parts = [];
+					if (done > 0) parts.push(t("plugins.sumDone", { count: done }));
+					if (failed > 0) parts.push(t("plugins.sumFailed", { count: failed }));
+					if (pending > 0) parts.push(t("plugins.sumPending", { count: pending }));
+					if (blocked > 0) parts.push(t("plugins.sumBlocked", { count: blocked }));
+					return t("plugins.summary", { parts: parts.join(t("plugins.sumJoin")) });
+				}
 				if (failed > 0 && pending > 0) return t("plugins.doneMixed", { failed, pending });
 				if (failed > 0) return t("plugins.doneSome", { failed });
 				if (pending > 0) return t("plugins.donePending", { pending });
@@ -1043,18 +1150,33 @@ window.__ModuleLoader__.load({
 						stateText = t("plugins.updating");
 						tone = "active";
 					}
+					if (market.overlay === pkg.name && result === void 0) {
+						stateText = t("plugins.overlayWorking");
+						tone = "active";
+					}
 					if (result !== void 0) {
 						if (result.status === "done") {
-							stateText = t("plugins.installed", {
-								version: result.installedVersion === void 0 ? pkg.latestVersion : result.installedVersion
-							});
-							tone = "done";
+							stateText = result.overlaid === true
+								? t("plugins.overlayDone", {
+									version: result.installedVersion === void 0 ? pkg.latestVersion : result.installedVersion
+								})
+								: t("plugins.installed", {
+									version: result.installedVersion === void 0 ? pkg.latestVersion : result.installedVersion
+								});
+							tone = result.overlaid === true ? "warn" : "done";
+							stateTitle = result.overlaid === true ? t("plugins.blockedNote") : void 0;
 						} else if (result.status === "pending") {
 							// The release is still inside the market's maturity hold:
 							// nothing to retry, it becomes installable on its own later.
 							stateText = t("plugins.pendingHold");
 							stateTitle = result.error;
 							tone = "pending";
+						} else if (result.status === "blocked") {
+							// The plugin is mounted and even the overlay install was
+							// refused (an old Host, or a read-only profile).
+							stateText = t("plugins.blocked");
+							stateTitle = result.error;
+							tone = "warn";
 						} else if (result.status === "failed") {
 							stateText = t("plugins.failed", { reason: result.error === void 0 ? "?" : result.error });
 							stateTitle = result.error;
@@ -1132,6 +1254,13 @@ window.__ModuleLoader__.load({
 			const notes = [];
 			if (restartNeeded) notes.push(t("plugins.restart"));
 			else if (refreshNeeded) notes.push(t("plugins.refreshHint"));
+			const blockedResults = Object.values(market.results).filter((result) => result.status === "blocked");
+			// An old Host has no overlay route; restarting DSH loads it from disk,
+			// so offer the very restart that makes the next run work.
+			const overlayBlocked = blockedResults.some((result) => result.code === "overlay-unavailable");
+			if (blockedResults.length > 0) {
+				notes.push(overlayBlocked ? t("plugins.overlayUnavailable") : t("plugins.blockedNote"));
+			}
 			if (market.restartError === "manual") notes.push(t("plugins.restartManual"));
 			else if (market.restartError === "stale") notes.push(t("plugins.restartStale"));
 			else if (market.restartError !== void 0) notes.push(t("plugins.restartFailed", { reason: market.restartError }));
@@ -1179,7 +1308,7 @@ window.__ModuleLoader__.load({
 						},
 						actionLabel
 					),
-					restartNeeded
+					restartNeeded || overlayBlocked
 						? h(
 							"button",
 							{
@@ -1358,6 +1487,7 @@ window.__ModuleLoader__.load({
 			'.dsh-ocu-row[data-tone="error"] .dsh-ocu-row-state{color:var(--dsw-alias-state-error-primary,#d64545)}',
 			'.dsh-ocu-row[data-tone="done"] .dsh-ocu-row-state{color:var(--dsw-alias-state-success-primary,#2f9e5f)}',
 			'.dsh-ocu-row[data-tone="pending"] .dsh-ocu-row-state{color:var(--dsw-alias-state-warning-primary,#b07d1a)}',
+			'.dsh-ocu-row[data-tone="warn"] .dsh-ocu-row-state{color:var(--dsw-alias-state-warning-primary,#b07d1a)}',
 			'.dsh-ocu-card[data-tone="warn"]{border-color:var(--dsw-alias-state-warning-primary,#b07d1a)}',
 			'.dsh-ocu-card[data-tone="warn"] .dsh-ocu-card-value{color:var(--dsw-alias-state-warning-primary,#b07d1a)}',
 			".dsh-ocu-card-note{margin:0;font-size:12px;line-height:1.6;color:var(--dsw-alias-label-secondary,#6b6b70)}",

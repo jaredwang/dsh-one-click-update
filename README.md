@@ -14,6 +14,8 @@ A one-click, zero-effort updater for the [DSH](https://github.com/deepseek-ai/de
 
 1. **插件市场**：先读插件市场公开的 [Update API v1](https://www.npmjs.com/package/dshmarket)（`GET /dsh-market/api/v1/capabilities` 与 `GET /dsh-market/api/v1/updates/summary`），拿到所有可更新插件。
 2. 对每个可更新插件**串行**发 `POST /dsh-market/api/v1/updates`，然后轮询 `GET /dsh-market/api/v1/operations?operationId=…`（700ms 一次，8 分钟上限），逐行显示 `已安装版本 → 目标版本` 与状态；真正失败的插件显示插件市场返回的失败原因并可点「重试失败项」；**仍在新版本成熟期内的插件显示为「等待成熟期」**——这不是失败，等市场放行后会自然变成可更新，因此不给「重试」按钮。
+**已经挂载（in-use）的插件不会被卡住**：桌面 Host 不允许在插件仍然挂载时热移除，而市场的托管更新是「先移除再安装」，所以这类插件会返回 `bundle-in-use`（原文「这个插件正在使用中，桌面端不允许现在移除」）。遇到这个失败码时，页面自动改走本插件的 `POST /dsh-one-click-update/overlay`：用桌面 Host 的 pnpm 把目标版本**覆盖安装**进 profile（不动已挂载的 loader 行），成功后同样标记「需要重启 DSH」，重启后新版本生效。若 Host 还没有这条路由（旧版插件半部尚未重启），则提示「当前 Host 还不支持覆盖安装」并直接给出「立即重启 DSH」按钮——重启后重新打开本页，它会自动走覆盖安装（也可以按提示手动 `pnpm add`）。
+
 3. **让更新生效**：更新完成后，页面自己处理版本切换——只更新了客户端插件（`refreshRequired`）时自动刷新页面并提示「刷新页面后即可新建会话」（避免新旧两套 client modules 混用导致新建会话报错）；有插件的 Host 半部变了（`restartRequired`）时显示「立即重启 DSH」按钮，一键把桌面 App 退出并重新打开。重启提醒会用 Host 的 `bootId` 记在 `localStorage` 里，**刷新页面也不会丢**；如果同时有 App 更新在跑，页面刷新会让位给 App 自带的更新流程（它自己会重启）。
 4. **DSH 桌面 App**：再读桌面端注入的 `window.dshDesktop.updates`（`status()` / `subscribe()` / `open()`）；只有确实存在新版本时页面才自动调用 `updates.open()`（检查 → 下载 → 安装 → 重启），避免每次打开都弹原生「已是最新」框。
 5. 入口图标综合两边状态：有新版本 = 品牌色 + 呼吸圆点；正在更新 = 环形进度；出错 = 红色警示。
@@ -29,6 +31,8 @@ A one-click, zero-effort updater for the [DSH](https://github.com/deepseek-ai/de
 | 完成（仅客户端插件） | 灰色 | 插件更新完成 + 「刷新页面后即可新建会话」，页面自动刷新一次 |
 | 完成（Host 半部变了） | 品牌色 | 插件更新完成，需要重启 DSH 后生效 + 「立即重启 DSH」 |
 | 有插件在成熟期 | 灰色 | 「N 个等待成熟期」，不给重试按钮 |
+| 插件已挂载、覆盖安装成功 | 品牌色 | 「已覆盖安装 x.y.z，重启后生效」+ 「立即重启 DSH」 |
+| 插件已挂载、Host 尚未加载覆盖安装路由 | 品牌色 | 「当前 Host 还不支持覆盖安装」+ 「立即重启 DSH」（重启后重试即可） |
 | 失败 | 红色警示 | 失败原因 + 重试失败项 |
 
 ## 用到的接口
@@ -50,12 +54,15 @@ A one-click, zero-effort updater for the [DSH](https://github.com/deepseek-ai/de
 | --- | --- | --- |
 | GET | `/dsh-one-click-update/restart` | 读取重启能力（`supported` / `mode` / `appPath` / `bundleId`，无副作用） |
 | POST | `/dsh-one-click-update/restart[?dryRun=1]` | 202 = 已启动重启助手；501 = 当前 Host 不是桌面 App 的 Host；409 = 正在重启 |
+| GET | `/dsh-one-click-update/overlay` | 读取覆盖安装能力（`overlay` / `reason`，无副作用） |
+| POST | `/dsh-one-click-update/overlay` | `{name,version}` 覆盖安装到当前 profile：200 = 已安装且需重启；400 = 包名/版本非法、未在 profile 声明或不是更新；409 = 成熟期或并发；501 = Host 没有桌面包的 pnpm 上下文；500 = 安装失败/落盘校验不一致；504 = 超时 |
 
 ## 明确的限制（不是 bug）
 
 - **App 的最后一步原生确认框不可跳过**：主进程在重启前会弹出自己的「安装并重启」确认对话框，并会阻止在有活跃任务时重启。插件不能、也不应该绕过它。
 - **更新 App 只能在 DSH 桌面 App 内使用**：`window.dshDesktop` 由 Electron preload 注入，纯浏览器打开 `http://127.0.0.1:PORT` 时不存在，页面会显示「更新 DSH 桌面 App 仅在桌面 App 内可用」；此时插件市场的更新仍然可用（同一 Host 源）。
 - **重启靠一个后台助手脚本**：桌面端 preload 没有 quit/relaunch 通道，插件市场自己的 restart 在 desktop 下也被禁用（`restart.supported: false`，`managedBy: "desktop-host"`），所以「立即重启 DSH」由本插件的 Host 路由写一个临时脚本、脱离进程运行：先用 AppleScript 让 App 正常退出，确认主进程退出后再 `open` 重新打开。它**不会强杀**——如果 App 正在跑任务、退出被确认框拦住，助手会放弃并让确认框由你决定。重启入口只在「Host 真的是桌面 App 拉起的」情况下可用（普通 `dsh web` 会得到 501，网页端改用插件市场自己的 restart 接口）。
+- **覆盖安装不是「热更新」**：它只把新版本写到磁盘，正在运行的 Host/页面仍跑旧代码，必须重启 DSH 才生效；之所以这样做，是因为桌面 Host 在插件挂载期间拒绝移除（`bundle-in-use`），而市场托管更新必须先移除。覆盖安装不绕过 market 的成熟期检查（超时/成熟期会如实返回 409），也不改变 profile 里 `dsh.profile.bundles` 的选择。
 - **桌面端可能压住刚发布的新版本**：market 的 `holdYoungReleases` 会让刚发布的版本暂不显示为可更新；此时 summary 会显示 `updatable: 0`，属正常。
 - **operation 只活在当前 Host 进程里**：查不到的 operation 会 404（本插件按 “operation lost” 失败处理），重启 Harness 后旧的 operation id 即失效。
 - 当前 DSH App 版本号不在 product API 里（只给 `phase` / `version` / `percent` / `failure`），「当前版本」由桌面端自己的对话框展示。
@@ -71,12 +78,12 @@ A one-click, zero-effort updater for the [DSH](https://github.com/deepseek-ai/de
 ```
 package.json        bundle 清单（dsh.bundle.patch + dsh.client）
 cordis.patch.yml    insert 本插件
-index.js            Host 半部：只注册 /dsh-one-click-update/restart（一键重启助手脚本）
+index.js            Host 半部：/dsh-one-click-update/restart（一键重启助手脚本）与 /dsh-one-click-update/overlay（已挂载插件的覆盖安装）
 client.js           浏览器半部：slot 注册 + 更新状态机 + React 组件
 locale/{zh,en}.json 插件管理器里显示的标题与描述
 icon.svg            64x64 图标
 test/smoke.mjs      离线冒烟测试（mini React + 伪 fetch/桥）
-test/host.mjs       Host 半部单测（平台分支、路由拒绝路径、slot 注册与清理）
+test/host.mjs       Host 半部单测（平台分支、路由拒绝路径、覆盖安装校验、slot 注册与清理）
 ```
 
 ## 安装 / 卸载
@@ -104,9 +111,17 @@ npm test        # = node test/smoke.mjs && node test/host.mjs
 node --check client.js
 ```
 
-冒烟测试不依赖任何 npm 包：它用一个 mini React 与伪 `fetch` / 伪桌面桥渲染真实的 `client.js`，覆盖自动开始、串行更新、失败重试、**成熟期等待（不是失败）**、客户端更新后的自动刷新、**一键重启按钮与请求**、无插件市场、无桌面桥，以及 App 状态晚到（慢 `updates.status()`）仍会自动打开更新等路径。`test/host.mjs` 用假的 `ctx` / request / response 覆盖 macOS / Windows / Linux 的重启脚本、非桌面 Host 的 501、外站 Origin 的 403、重复重启的 409 与路由清理。
+冒烟测试不依赖任何 npm 包：它用一个 mini React 与伪 `fetch` / 伪桌面桥渲染真实的 `client.js`，覆盖自动开始、串行更新、失败重试、**成熟期等待（不是失败）**、**已挂载插件回退覆盖安装（以及 Host 未加载路由时的受阻提示）**、客户端更新后的自动刷新、**一键重启按钮与请求**、无插件市场、无桌面桥，以及 App 状态晚到（慢 `updates.status()`）仍会自动打开更新等路径（78 项断言）。`test/host.mjs` 用假的 `ctx` / request / response 覆盖 macOS / Windows / Linux 的重启脚本、非桌面 Host 的 501、外站 Origin 的 403、重复重启的 409、覆盖安装的参数/版本/依赖/成熟期/落盘校验与并发 409，以及两条路由的注册与清理（72 项断言）。
 
 ## 更新说明
+
+### 0.3.0
+
+- 修复：更新已挂载的插件（如 `dsh-better-sidebar`）时，页面把桌面端的 `bundle-in-use` 拒绝原文直接显示成「失败：这个插件正在使用中，桌面端不允许现在移除」。现在这类失败会自动回退为**覆盖安装**，成功即显示「已覆盖安装 x.y.z，重启后生效」并给出「立即重启 DSH」。
+- 新增 Host 路由 `GET/POST /dsh-one-click-update/overlay`：校验包名/版本号、profile 依赖声明、目标版本必须更新；用桌面 Host 的 pnpm 执行 `add <name>@<version> --save-exact`，安装后重新读取 profile 与 `node_modules` 校验落盘版本；成熟期返回 409 `RELEASE_TOO_FRESH`，超时 504，失败 500，非桌面 Host 501。
+- 新增客户端识别 `bundle-in-use` / `stop-profile` / `not-removable` 失败码，并新增「覆盖安装成功」「需重启后更新」两种行状态与汇总文案；`blocked` 结果不会被当成可重试失败。若覆盖安装路由尚未加载（旧 Host），页面会直接给出「立即重启 DSH」，重启后重试即可。
+- 升级提示：本版本新增了 Host 路由，装好后需要**重启一次 DSH**（或先触发一键重启）才能使用覆盖安装；在重启前回退会明确显示「需重启后更新」和手动 `pnpm add` 命令，不会静默失败。
+- 测试：`test/host.mjs` 72 项、`test/smoke.mjs` 78 项断言。
 
 ### 0.2.0
 

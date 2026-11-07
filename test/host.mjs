@@ -3,11 +3,19 @@
 // objects and injectable plans/launchers drive every branch.
 //
 // Run with `npm test` (Node 20+, no dependencies).
+import { EventEmitter } from "node:events";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import {
+	OVERLAY_PATH,
 	PLUGIN_NAME,
 	RESTART_PATH,
 	apply,
+	compareVersions,
+	createOverlayHandler,
 	createRestartHandler,
+	describeOverlayTarget,
 	isDesktopHost,
 	restartPlan
 } from "../index.js";
@@ -108,8 +116,8 @@ function fakeResponse() {
 	};
 	return res;
 }
-function fakeRequest(method, url, headers) {
-	return { method, url, headers: headers ?? {} };
+function fakeRequest(method, url, headers, body) {
+	return { method, url, headers: headers ?? {}, body };
 }
 const jsonBody = (res) => {
 	try {
@@ -209,6 +217,192 @@ const plan = () => ({
 }
 
 /* ------------------------------------------------------------------ */
+/* Overlay installs                                                    */
+/* ------------------------------------------------------------------ */
+{
+	ok("versions compare by number", compareVersions("0.30.1", "0.28.2") > 0, compareVersions("0.30.1", "0.28.2"));
+	ok("equal versions compare flat", compareVersions("1.2.3", "1.2.3") === 0);
+	ok("prereleases sort before releases", compareVersions("0.2.0-rc.1", "0.2.0") < 0);
+	ok("releases sort after prereleases", compareVersions("0.2.0", "0.2.0-rc.1") > 0);
+}
+
+{
+	const missing = describeOverlayTarget(undefined);
+	ok("no profile context means no overlay", missing.available === false && missing.reason === "not-desktop-host", missing);
+	const noManager = describeOverlayTarget({ get: () => ({ profileDirectory: "/tmp/p" }) });
+	ok("a context without a package manager is refused", noManager.available === false, noManager);
+	const described = describeOverlayTarget({
+		get: () => ({ packageManager: { command: "/x/pnpm", args: ["--dir"], env: { PATH: "/x" } }, profileDirectory: "/tmp/p", profile: "desktop" })
+	});
+	ok("the published invocation is used", described.available === true && described.profile === "desktop", described);
+	ok(
+		"the invocation keeps its own argv",
+		described.invocation.command === "/x/pnpm" && described.invocation.args[0] === "--dir",
+		described.invocation
+	);
+}
+
+const overlayDir = mkdtempSync(join(tmpdir(), "ocu-overlay-"));
+const overlayManifest = join(overlayDir, "package.json");
+const overlayPackage = join(overlayDir, "node_modules", "dsh-better-sidebar");
+mkdirSync(overlayPackage, { recursive: true });
+const writeProfile = (version) => {
+	writeFileSync(overlayManifest, JSON.stringify({ name: "desktop", dependencies: { "dsh-better-sidebar": version } }, null, 2));
+};
+const writeInstalled = (version) => {
+	writeFileSync(join(overlayPackage, "package.json"), JSON.stringify({ name: "dsh-better-sidebar", version }, null, 2));
+};
+writeProfile("0.28.2");
+writeInstalled("0.28.2");
+const overlayTarget = () => ({
+	available: true,
+	profile: "desktop",
+	directory: overlayDir,
+	invocation: { command: "/x/pnpm", args: [], env: {} }
+});
+
+function fakeStreamRequest(method, url, headers, payload) {
+	const request = new EventEmitter();
+	request.method = method;
+	request.url = url;
+	request.headers = headers ?? {};
+	process.nextTick(() => {
+		if (payload !== undefined) request.emit("data", Buffer.from(JSON.stringify(payload)));
+		request.emit("end");
+	});
+	return request;
+}
+
+{
+	const runs = [];
+	const handler = createOverlayHandler({
+		target: overlayTarget,
+		run: async (current, args) => {
+			runs.push(args);
+			const version = args[1].slice(args[1].lastIndexOf("@") + 1);
+			writeProfile(version);
+			writeInstalled(version);
+			return { exitCode: 0, stdout: "Progress: resolved 1", stderr: "", timedOut: false };
+		}
+	});
+
+	const capability = fakeResponse();
+	await handler(fakeRequest("GET", OVERLAY_PATH), capability);
+	ok("GET describes the overlay", capability.status === 200 && jsonBody(capability).overlay === true, capability.body);
+
+	const wrongMethod = fakeResponse();
+	await handler(fakeRequest("PUT", OVERLAY_PATH), wrongMethod);
+	ok("the overlay refuses other methods", wrongMethod.status === 405, wrongMethod.status);
+
+	const done = fakeResponse();
+	await handler(fakeRequest("POST", OVERLAY_PATH, {}, { name: "dsh-better-sidebar", version: "0.30.1" }), done);
+	const doneBody = jsonBody(done);
+	ok("a valid overlay install is accepted", done.status === 200 && doneBody.ok === true, done.body);
+	ok("the overlay reports the new version", doneBody.version === "0.30.1" && doneBody.from === "0.28.2", done.body);
+	ok("the overlay asks for a restart", doneBody.restartRequired === true, done.body);
+	ok(
+		"the overlay installs exact and over the running copy",
+		runs.length === 1 && JSON.stringify(runs[0]) === JSON.stringify(["add", "dsh-better-sidebar@0.30.1", "--save-exact"]),
+		JSON.stringify(runs)
+	);
+
+	const streamed = fakeResponse();
+	await handler(fakeStreamRequest("POST", OVERLAY_PATH, {}, { name: "dsh-better-sidebar", version: "0.30.2" }), streamed);
+	ok("a streamed JSON body is read", streamed.status === 200 && jsonBody(streamed).ok === true, streamed.body);
+
+	const downgrade = fakeResponse();
+	await handler(fakeRequest("POST", OVERLAY_PATH, {}, { name: "dsh-better-sidebar", version: "0.28.0" }), downgrade);
+	ok("a downgrade is refused before running pnpm", downgrade.status === 400 && runs.length === 2, downgrade.body);
+
+	const undeclared = fakeResponse();
+	await handler(fakeRequest("POST", OVERLAY_PATH, {}, { name: "left-pad", version: "1.0.0" }), undeclared);
+	ok("a package outside the profile is refused", undeclared.status === 400 && jsonBody(undeclared).error.includes("not a dependency"), undeclared.body);
+
+	const badName = fakeResponse();
+	await handler(fakeRequest("POST", OVERLAY_PATH, {}, { name: "../../etc/passwd", version: "1.0.0" }), badName);
+	ok("a package name that is not a name is refused", badName.status === 400, badName.body);
+
+	const badVersion = fakeResponse();
+	await handler(fakeRequest("POST", OVERLAY_PATH, {}, { name: "dsh-better-sidebar", version: "latest" }), badVersion);
+	ok("a tag is not a version", badVersion.status === 400, badVersion.body);
+
+	const foreign = fakeResponse();
+	await handler(
+		fakeRequest("POST", OVERLAY_PATH, { origin: "https://evil.example", host: "127.0.0.1:62550" }, { name: "dsh-better-sidebar", version: "0.30.3" }),
+		foreign
+	);
+	ok("a foreign origin cannot overlay", foreign.status === 403, foreign.body);
+}
+
+{
+	const handler = createOverlayHandler({
+		target: overlayTarget,
+		run: async () => ({ exitCode: 1, stdout: "ERR_PNPM_MINIMUM_RELEASE_AGE", stderr: "release-age", timedOut: false })
+	});
+	const held = fakeResponse();
+	await handler(fakeRequest("POST", OVERLAY_PATH, {}, { name: "dsh-better-sidebar", version: "9.0.0" }), held);
+	ok("a held release is reported as a hold", held.status === 409 && jsonBody(held).code === "RELEASE_TOO_FRESH", held.body);
+}
+
+{
+	const handler = createOverlayHandler({
+		target: overlayTarget,
+		run: async () => ({ exitCode: 1, stdout: "", stderr: "ERR_PNPM_FETCH_404", timedOut: false })
+	});
+	const broken = fakeResponse();
+	await handler(fakeRequest("POST", OVERLAY_PATH, {}, { name: "dsh-better-sidebar", version: "9.0.0" }), broken);
+	ok("a failed install is reported", broken.status === 500 && jsonBody(broken).code === "install-failed", broken.body);
+}
+
+{
+	const handler = createOverlayHandler({
+		target: overlayTarget,
+		run: async () => ({ exitCode: 0, stdout: "", stderr: "", timedOut: false })
+	});
+	const stale = fakeResponse();
+	await handler(fakeRequest("POST", OVERLAY_PATH, {}, { name: "dsh-better-sidebar", version: "9.0.0" }), stale);
+	ok("files that did not change are not success", stale.status === 500 && jsonBody(stale).code === "install-mismatch", stale.body);
+}
+
+{
+	const refused = createOverlayHandler({
+		target: () => ({ available: false, reason: "not-desktop-host" }),
+		run: async () => {
+			throw new Error("must not run");
+		}
+	});
+	const capability = fakeResponse();
+	await refused(fakeRequest("GET", OVERLAY_PATH), capability);
+	ok("a web host describes why overlay is unavailable", capability.status === 200 && jsonBody(capability).overlay === false, capability.body);
+	const res = fakeResponse();
+	await refused(fakeRequest("POST", OVERLAY_PATH, {}, { name: "dsh-better-sidebar", version: "0.30.1" }), res);
+	const body = jsonBody(res);
+	ok("a web host refuses to overlay", res.status === 501 && typeof body.hint === "string", res.body);
+}
+
+{
+	let release;
+	const gate = new Promise((resolve) => {
+		release = resolve;
+	});
+	const handler = createOverlayHandler({
+		target: overlayTarget,
+		run: async () => {
+			await gate;
+			return { exitCode: 1, stdout: "", stderr: "nope", timedOut: false };
+		}
+	});
+	const first = handler(fakeRequest("POST", OVERLAY_PATH, {}, { name: "dsh-better-sidebar", version: "9.0.0" }), fakeResponse());
+	await new Promise((resolve) => setTimeout(resolve, 20));
+	const second = fakeResponse();
+	await handler(fakeRequest("POST", OVERLAY_PATH, {}, { name: "dsh-better-sidebar", version: "9.0.1" }), second);
+	ok("a concurrent overlay is refused", second.status === 409, second.body);
+	release();
+	await first;
+}
+rmSync(overlayDir, { recursive: true, force: true });
+
+/* ------------------------------------------------------------------ */
 /* Plugin wiring                                                       */
 /* ------------------------------------------------------------------ */
 {
@@ -235,13 +429,14 @@ const plan = () => ({
 		}
 	};
 	apply(ctx);
-	ok("apply registers one route", routes.length === 1, routes.length);
-	ok("the route is the restart path", routes[0] && routes[0].path === RESTART_PATH && routes[0].kind === "exact", routes[0] && routes[0].path);
-	ok("the route has a handler", typeof (routes[0] && routes[0].handler) === "function");
-	ok("the route is disposable", disposers.length === 1 && typeof disposers[0] === "function", disposers.length);
+	ok("apply registers both routes", routes.length === 2, routes.length);
+	ok("the first route is the restart path", routes[0] && routes[0].path === RESTART_PATH && routes[0].kind === "exact", routes[0] && routes[0].path);
+	ok("the second route is the overlay path", routes[1] && routes[1].path === OVERLAY_PATH && routes[1].kind === "exact", routes[1] && routes[1].path);
+	ok("both routes have handlers", typeof (routes[0] && routes[0].handler) === "function" && typeof (routes[1] && routes[1].handler) === "function");
+	ok("both routes are disposable", disposers.length === 2 && disposers.every((dispose) => typeof dispose === "function"), disposers.length);
 	ok("no warning with a web server", warnings.length === 0, warnings);
-	disposers[0]?.();
-	ok("disposing removes the route", routes.length === 0, routes.length);
+	for (const dispose of disposers) dispose();
+	ok("disposing removes the routes", routes.length === 0, routes.length);
 }
 
 {

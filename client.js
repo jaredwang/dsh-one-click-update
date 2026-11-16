@@ -26,6 +26,12 @@ window.__ModuleLoader__.load({
 		const PANEL_ID = "one-click-update";
 		const STYLE_ID = "dsh-one-click-update-style";
 		const API = "/dsh-market/api/v1";
+		/**
+		 * The market panel's own listing (not part of public API v1). It is the only
+		 * place that exposes the releases still inside the desktop maturity hold and
+		 * the mature version an updatable package will really install.
+		 */
+		const INTERNAL_UPDATES = "/dsh-market/updates";
 		/** Host route of this bundle: restarts the desktop app (see index.js). */
 		const RESTART_API = "/dsh-one-click-update/restart";
 		/** Host route of this bundle: installs over a mounted bundle (see index.js). */
@@ -50,6 +56,10 @@ window.__ModuleLoader__.load({
 				"plugins.checked": "已检查 {checked} 个已安装插件",
 				"plugins.none": "所有插件都是最新版本",
 				"plugins.count": "{count} 个插件可更新",
+				"plugins.countHeld": "{count} 个插件可更新，{held} 个等待成熟期",
+				"plugins.heldOnly": "暂无可以更新的插件，{held} 个等待成熟期",
+				"plugins.heldNote": "部分插件的最新版仍在成熟期，本次先更新到已成熟的版本。",
+				"plugins.heldHint": "最新版 {version} 仍在成熟期，本次先更新到已成熟的版本。",
 				"plugins.unsupported": "未检测到插件市场，无法更新插件",
 				"plugins.error": "检查插件更新失败：{reason}",
 				"plugins.running": "正在更新 {name}（{done}/{total}）",
@@ -81,6 +91,12 @@ window.__ModuleLoader__.load({
 				"plugins.pendingHold": "等待成熟期（发布满期限后可更新）",
 				"plugins.donePending": "插件更新完成，{pending} 个等待成熟期",
 				"plugins.doneMixed": "插件更新完成，{failed} 个失败，{pending} 个等待成熟期",
+				"section.held": "等待成熟期",
+				"held.meta": "{count} 个插件",
+				"held.until": "{when} 后可更新",
+				"held.untilEstimated": "预计 {when} 前后可更新",
+				"held.untilUnknown": "发布满期限后可更新",
+				"held.note": "成熟期内的插件不参与本次更新；到期后重新检查即可更新。",
 				"plugins.restartNow": "立即重启 DSH",
 				"plugins.restarting": "正在重启 DSH…",
 				"plugins.restartFailed": "重启失败：{reason}",
@@ -128,6 +144,10 @@ window.__ModuleLoader__.load({
 				"plugins.checked": "{checked} installed plugins checked",
 				"plugins.none": "All plugins are up to date",
 				"plugins.count": "{count} plugins can be updated",
+				"plugins.countHeld": "{count} plugins can be updated, {held} waiting for maturity",
+				"plugins.heldOnly": "Nothing to update; {held} plugins waiting for maturity",
+				"plugins.heldNote": "Some plugins have a newer release still inside the maturity hold; this run installs the mature version instead.",
+				"plugins.heldHint": "Version {version} is still maturing; this run installs the mature release.",
 				"plugins.unsupported": "Plugin market not found, plugins can't be updated",
 				"plugins.error": "Plugin check failed: {reason}",
 				"plugins.running": "Updating {name} ({done}/{total})",
@@ -159,6 +179,12 @@ window.__ModuleLoader__.load({
 				"plugins.pendingHold": "Waiting for the maturity hold to clear",
 				"plugins.donePending": "Plugins updated, {pending} waiting for maturity",
 				"plugins.doneMixed": "Plugins updated, {failed} failed, {pending} waiting for maturity",
+				"section.held": "Maturity hold",
+				"held.meta": "{count} plugins",
+				"held.until": "Available after {when}",
+				"held.untilEstimated": "Estimated around {when}",
+				"held.untilUnknown": "Available once the release matures",
+				"held.note": "Plugins in the maturity hold are not part of this update; check again once the hold clears.",
 				"plugins.restartNow": "Restart DSH now",
 				"plugins.restarting": "Restarting DSH…",
 				"plugins.restartFailed": "Restart failed: {reason}",
@@ -290,6 +316,8 @@ window.__ModuleLoader__.load({
 				checked: 0,
 				updatable: 0,
 				packages: [],
+				/** Installed plugins whose newer release is still inside the maturity hold. */
+				held: [],
 				error: void 0,
 				running: false,
 				finished: false,
@@ -441,13 +469,82 @@ window.__ModuleLoader__.load({
 			}
 		}
 
+		/**
+		 * Read the market panel's full listing. Public API v1's summary lists only
+		 * updatable packages, so held releases and the actually installable version
+		 * are read from here. The call is deliberately best-effort: an older market
+		 * without this route just produces the plain v1 view and no hold category.
+		 */
+		async function readUpdateDetails() {
+			const res = await apiGet(INTERNAL_UPDATES);
+			if (res.status !== 200 || res.body === null || typeof res.body !== "object") return void 0;
+			const updates = res.body.updates;
+			if (updates === null || typeof updates !== "object" || Array.isArray(updates)) return void 0;
+			return updates;
+		}
+
+		/** The version an update will really install (the mature one when latest is held). */
+		function targetVersionOf(pkg, detail) {
+			if (detail !== null && typeof detail === "object" && typeof detail.eligibleVersion === "string" && detail.eligibleVersion !== "") {
+				return detail.eligibleVersion;
+			}
+			return pkg.latestVersion;
+		}
+
+		/** Annotate v1 rows with the mature target and the newer held release, if any. */
+		function annotatePackages(packages, details) {
+			return packages.map((pkg) => {
+				if (details === void 0) return { ...pkg, targetVersion: pkg.latestVersion };
+				const detail = details[pkg.name];
+				const target = targetVersionOf(pkg, detail);
+				const next = { ...pkg, targetVersion: target };
+				const held = detail !== null && typeof detail === "object" ? detail.heldUpdate : void 0;
+				if (held !== null && typeof held === "object" && typeof held.latest === "string" && held.latest !== "" && held.latest !== target) {
+					next.heldVersion = held.latest;
+					if (typeof held.until === "string" && held.until !== "") next.heldUntil = held.until;
+					if (held.estimated === true) next.heldEstimated = true;
+				}
+				return next;
+			});
+		}
+
+		/** Held-only packages: present in the market listing, absent from v1's summary. */
+		function collectHeld(details) {
+			if (details === void 0) return [];
+			const rows = [];
+			for (const [name, detail] of Object.entries(details)) {
+				if (detail === null || typeof detail !== "object") continue;
+				if (detail.updateAvailable === true) continue;
+				const hold = detail.heldUpdate;
+				if (hold === null || typeof hold !== "object") continue;
+				const version = typeof hold.latest === "string" && hold.latest !== ""
+					? hold.latest
+					: typeof detail.latest === "string" && detail.latest !== ""
+						? detail.latest
+						: void 0;
+				if (version === void 0) continue;
+				rows.push({
+					name,
+					installedVersion: typeof detail.current === "string"
+						? detail.current
+						: typeof detail.version === "string"
+							? detail.version
+							: "?",
+					heldVersion: version,
+					...(typeof hold.until === "string" && hold.until !== "" ? { heldUntil: hold.until } : {}),
+					...(hold.estimated === true ? { heldEstimated: true } : {})
+				});
+			}
+			return rows.sort((a, b) => a.name.localeCompare(b.name));
+		}
+
 		/** Ask the market which installed plugins can be updated. */
 		async function checkPlugins(force) {
 			if (state.market.running) return;
 			patchMarket({ status: "checking", error: void 0 });
 			const res = await apiGet(API + "/updates/summary" + (force ? "?force=1" : ""));
 			if (res.status === 404) {
-				patchMarket({ status: "unsupported", checked: 0, updatable: 0, packages: [] });
+				patchMarket({ status: "unsupported", checked: 0, updatable: 0, packages: [], held: [] });
 				return;
 			}
 			if (res.status !== 200 || res.body === void 0) {
@@ -456,11 +553,16 @@ window.__ModuleLoader__.load({
 			}
 			const body = res.body;
 			const packages = Array.isArray(body.packages) ? body.packages : [];
+			// Read after the summary so the market's cached check (already refreshed
+			// by an explicit recheck) answers without a second network round.
+			const details = await readUpdateDetails();
+			const annotated = annotatePackages(packages, details);
 			patchMarket({
 				status: "ready",
 				checked: typeof body.checked === "number" ? body.checked : 0,
-				updatable: packages.length,
-				packages,
+				updatable: annotated.length,
+				packages: annotated,
+				held: collectHeld(details),
 				error: void 0
 			});
 		}
@@ -659,7 +761,8 @@ window.__ModuleLoader__.load({
 			const chosen = state.market.packages.filter((pkg) => {
 				if (onlyNames !== void 0 && onlyNames.indexOf(pkg.name) === -1) return false;
 				const result = state.market.results[pkg.name];
-				return result === void 0 || result.status !== "done";
+				// A held release is waiting, not retryable: a rerun must not pick it up.
+				return result === void 0 || (result.status !== "done" && result.status !== "pending");
 			});
 			if (chosen.length === 0) {
 				patchMarket({ finished: true, current: void 0, percent: void 0 });
@@ -689,10 +792,15 @@ window.__ModuleLoader__.load({
 			const packages = state.market.packages.map((pkg) => {
 				const result = results[pkg.name];
 				if (result === void 0 || result.status !== "done") return pkg;
-				const installed = result.installedVersion === void 0 ? pkg.latestVersion : result.installedVersion;
+				const target = pkg.targetVersion === void 0 ? pkg.latestVersion : pkg.targetVersion;
+				const installed = result.installedVersion === void 0 ? target : result.installedVersion;
 				return { ...pkg, installedVersion: installed };
 			});
-			const remaining = packages.filter((pkg) => (results[pkg.name] === void 0 || results[pkg.name].status !== "done"));
+			// Pending holds stay visible in the hold category, not as updatable rows.
+			const remaining = packages.filter((pkg) => {
+				const result = results[pkg.name];
+				return result === void 0 || (result.status !== "done" && result.status !== "pending");
+			});
 			patchMarket({
 				running: false,
 				finished: true,
@@ -937,9 +1045,13 @@ window.__ModuleLoader__.load({
 
 		/** One status sentence for the plugin-update section. */
 		function describePlugins(market, t) {
+			const held = market.held.length;
 			if (market.running) {
-				const done = Object.keys(market.results).length;
-				const total = market.packages.length;
+				const done = Object.keys(market.results).filter((name) => market.results[name].status !== "pending").length;
+				const total = market.packages.filter((pkg) => {
+					const result = market.results[pkg.name];
+					return result === void 0 || result.status !== "pending";
+				}).length;
 				return t("plugins.running", { name: market.current === void 0 ? "" : market.current, done, total });
 			}
 			if (market.status === "unsupported") return t("plugins.unsupported");
@@ -949,7 +1061,10 @@ window.__ModuleLoader__.load({
 			if (market.refreshing === true) return t("plugins.refreshing");
 			if (market.finished) {
 				const results = Object.values(market.results);
-				if (results.length === 0) return t("plugins.none");
+				if (results.length === 0) {
+					// The auto-run still finished: a pure hold is not "up to date".
+					return held > 0 ? t("plugins.heldOnly", { held }) : t("plugins.none");
+				}
 				const failed = results.filter((result) => result.status === "failed").length;
 				const pending = results.filter((result) => result.status === "pending").length;
 				const blocked = results.filter((result) => result.status === "blocked").length;
@@ -969,8 +1084,12 @@ window.__ModuleLoader__.load({
 				if (pending > 0) return t("plugins.donePending", { pending });
 				return t("plugins.done");
 			}
-			if (market.updatable > 0) return t("plugins.count", { count: market.updatable });
-			return t("plugins.none");
+			if (market.updatable > 0) {
+				return held > 0
+					? t("plugins.countHeld", { count: market.updatable, held })
+					: t("plugins.count", { count: market.updatable });
+			}
+			return held > 0 ? t("plugins.heldOnly", { held }) : t("plugins.none");
 		}
 
 		/** idle | available | active | error */
@@ -991,7 +1110,14 @@ window.__ModuleLoader__.load({
 			else if (snapshot.market.finished === true && snapshot.market.status === "ready") parts.push(describePlugins(snapshot.market, t));
 			else if (snapshot.market.running) parts.push(describePlugins(snapshot.market, t));
 			else if (snapshot.market.status === "ready") {
-				parts.push(snapshot.market.updatable > 0 ? t("plugins.count", { count: snapshot.market.updatable }) : t("plugins.none"));
+				const held = snapshot.market.held.length;
+				if (snapshot.market.updatable > 0) {
+					parts.push(held > 0
+						? t("plugins.countHeld", { count: snapshot.market.updatable, held })
+						: t("plugins.count", { count: snapshot.market.updatable }));
+				} else {
+					parts.push(held > 0 ? t("plugins.heldOnly", { held }) : t("plugins.none"));
+				}
 			}
 			if (snapshot.app.supported) parts.push(describeApp(snapshot.app, t));
 			return parts.length === 0 ? t("panel") : parts.join(" · ");
@@ -1133,15 +1259,19 @@ window.__ModuleLoader__.load({
 			);
 		}
 
-		/** One row per upgradable plugin, with its own state. */
+		/** One row per upgradable plugin, with its own state. Held rows live elsewhere. */
 		function PluginRows(props) {
 			const market = props.market;
 			const t = props.t;
-			if (market.packages.length === 0) return null;
+			const rows = market.packages.filter((pkg) => {
+				const result = market.results[pkg.name];
+				return result === void 0 || result.status !== "pending";
+			});
+			if (rows.length === 0) return null;
 			return h(
 				"ul",
 				{ className: "dsh-ocu-rows" },
-				market.packages.map((pkg) => {
+				rows.map((pkg) => {
 					const result = market.results[pkg.name];
 					let stateText = t("plugins.pending");
 					let tone = "idle";
@@ -1156,21 +1286,13 @@ window.__ModuleLoader__.load({
 					}
 					if (result !== void 0) {
 						if (result.status === "done") {
+							const target = pkg.targetVersion === void 0 ? pkg.latestVersion : pkg.targetVersion;
+							const version = result.installedVersion === void 0 ? target : result.installedVersion;
 							stateText = result.overlaid === true
-								? t("plugins.overlayDone", {
-									version: result.installedVersion === void 0 ? pkg.latestVersion : result.installedVersion
-								})
-								: t("plugins.installed", {
-									version: result.installedVersion === void 0 ? pkg.latestVersion : result.installedVersion
-								});
+								? t("plugins.overlayDone", { version })
+								: t("plugins.installed", { version });
 							tone = result.overlaid === true ? "warn" : "done";
 							stateTitle = result.overlaid === true ? t("plugins.blockedNote") : void 0;
-						} else if (result.status === "pending") {
-							// The release is still inside the market's maturity hold:
-							// nothing to retry, it becomes installable on its own later.
-							stateText = t("plugins.pendingHold");
-							stateTitle = result.error;
-							tone = "pending";
 						} else if (result.status === "blocked") {
 							// The plugin is mounted and even the overlay install was
 							// refused (an old Host, or a read-only profile).
@@ -1201,12 +1323,114 @@ window.__ModuleLoader__.load({
 								{ className: "dsh-ocu-row-versions" },
 								h("span", { className: "dsh-ocu-version" }, pkg.installedVersion),
 								h("span", { className: "dsh-ocu-arrow", "aria-hidden": "true" }, "\u2192"),
-								h("span", { className: "dsh-ocu-version dsh-ocu-version-new" }, pkg.latestVersion)
+								h(
+									"span",
+									{
+										className: "dsh-ocu-version dsh-ocu-version-new",
+										title: pkg.heldVersion === void 0 ? void 0 : t("plugins.heldHint", { version: pkg.heldVersion })
+									},
+									pkg.targetVersion === void 0 ? pkg.latestVersion : pkg.targetVersion
+								)
 							)
 						),
 						h("span", { className: "dsh-ocu-row-state", title: stateTitle }, tone === "active" ? Spinner() : null, h("span", null, stateText))
 					);
 				})
+			);
+		}
+
+		/** Local month-day hour:minute for a hold's release time, or undefined. */
+		function holdWhen(row) {
+			if (typeof row.heldUntil !== "string") return void 0;
+			const when = new Date(row.heldUntil);
+			if (!Number.isFinite(when.getTime())) return void 0;
+			const pad = (value) => String(value).padStart(2, "0");
+			return (when.getMonth() + 1) + "-" + pad(when.getDate()) + " " + pad(when.getHours()) + ":" + pad(when.getMinutes());
+		}
+
+		/** When the market expects the release to become installable. */
+		function holdUntilText(row, t) {
+			const when = holdWhen(row);
+			if (when === void 0) return t("held.untilUnknown");
+			return t(row.heldEstimated === true ? "held.untilEstimated" : "held.until", { when });
+		}
+
+		/**
+		 * The hold category: packages whose newer release exists but is still inside
+		 * the market's maturity hold. They are never part of a run; the rows only
+		 * say what is waiting and when it should clear.
+		 */
+		function HeldRows(props) {
+			const rows = props.rows;
+			const t = props.t;
+			if (rows.length === 0) return null;
+			return h(
+				"ul",
+				{ className: "dsh-ocu-rows dsh-ocu-rows-held" },
+				rows.map((row) => h(
+					"li",
+					{ className: "dsh-ocu-row dsh-ocu-row-held", "data-tone": "pending", key: row.name },
+					h(
+						"span",
+						{ className: "dsh-ocu-row-main" },
+						h("code", { className: "dsh-ocu-row-name" }, row.name),
+						h(
+							"span",
+							{ className: "dsh-ocu-row-versions" },
+							h("span", { className: "dsh-ocu-version" }, row.installedVersion === void 0 ? "?" : row.installedVersion),
+							h("span", { className: "dsh-ocu-arrow", "aria-hidden": "true" }, "\u2192"),
+							h("span", { className: "dsh-ocu-version dsh-ocu-version-new" }, row.heldVersion)
+						)
+					),
+					h(
+						"span",
+						{ className: "dsh-ocu-row-state", title: t("plugins.pendingHold") },
+						h("span", null, holdUntilText(row, t))
+					)
+				))
+			);
+		}
+
+		function heldRowsOf(market) {
+			const rows = [...market.held];
+			const known = new Set(rows.map((row) => row.name));
+			// A run can still report a hold (the summary raced the market's check);
+			// keep that package visible here instead of in the updatable list.
+			for (const pkg of market.packages) {
+				const result = market.results[pkg.name];
+				if (result === void 0 || result.status !== "pending" || known.has(pkg.name)) continue;
+				known.add(pkg.name);
+				rows.push({
+					name: pkg.name,
+					installedVersion: pkg.installedVersion,
+					heldVersion: pkg.heldVersion === void 0
+						? pkg.targetVersion === void 0
+							? pkg.latestVersion
+							: pkg.targetVersion
+						: pkg.heldVersion,
+					...(pkg.heldUntil === void 0 ? {} : { heldUntil: pkg.heldUntil }),
+					...(pkg.heldEstimated === true ? { heldEstimated: true } : {})
+				});
+			}
+			return rows;
+		}
+
+		function HeldSection(props) {
+			const market = props.market;
+			const t = props.t;
+			const rows = heldRowsOf(market);
+			if (rows.length === 0) return null;
+			return h(
+				"section",
+				{ className: "dsh-ocu-card dsh-ocu-card-held", "data-tone": "held" },
+				h(
+					"div",
+					{ className: "dsh-ocu-card-head" },
+					h("h2", { className: "dsh-ocu-card-title" }, t("section.held")),
+					h("span", { className: "dsh-ocu-card-meta" }, t("held.meta", { count: rows.length }))
+				),
+				h(HeldRows, { rows, t }),
+				h("p", { className: "dsh-ocu-card-foot" }, t("held.note"))
 			);
 		}
 
@@ -1220,7 +1444,13 @@ window.__ModuleLoader__.load({
 				return result.status === "failed" && result.retryable !== false;
 			});
 			const succeeded = results.filter((result) => result.status === "done").length;
-			const showRows = market.packages.length > 0 && market.status !== "unsupported";
+			// Held packages are shown by HeldSection, never among the updatable rows.
+			const visibleRows = market.packages.filter((pkg) => {
+				const result = market.results[pkg.name];
+				return result === void 0 || result.status !== "pending";
+			});
+			const showRows = visibleRows.length > 0 && market.status !== "unsupported";
+			const heldAnnotated = market.packages.some((pkg) => pkg.heldVersion !== void 0);
 			const restartNeeded = market.restartRequired === true;
 			// Any successful plugin update changes the client-module release the page
 			// booted from; until it reloads, creating a new session can mix modules of
@@ -1254,6 +1484,7 @@ window.__ModuleLoader__.load({
 			const notes = [];
 			if (restartNeeded) notes.push(t("plugins.restart"));
 			else if (refreshNeeded) notes.push(t("plugins.refreshHint"));
+			if (heldAnnotated) notes.push(t("plugins.heldNote"));
 			const blockedResults = Object.values(market.results).filter((result) => result.status === "blocked");
 			// An old Host has no overlay route; restarting DSH loads it from disk,
 			// so offer the very restart that makes the next run work.
@@ -1264,8 +1495,11 @@ window.__ModuleLoader__.load({
 			if (market.restartError === "manual") notes.push(t("plugins.restartManual"));
 			else if (market.restartError === "stale") notes.push(t("plugins.restartStale"));
 			else if (market.restartError !== void 0) notes.push(t("plugins.restartFailed", { reason: market.restartError }));
-			const total = market.packages.length;
-			const done = Object.keys(market.results).length;
+			const total = visibleRows.length;
+			const done = Object.keys(market.results).filter((name) => {
+				const result = market.results[name];
+				return result.status !== "pending" && visibleRows.some((pkg) => pkg.name === name);
+			}).length;
 			const overall = busy && total > 0
 				? ((done + (market.percent === void 0 ? 0 : market.percent) / 100) / total) * 100
 				: 0;
@@ -1442,6 +1676,7 @@ window.__ModuleLoader__.load({
 					h("p", { className: "dsh-ocu-page-desc" }, t("page.desc"))
 				),
 				h(PluginSection, { market, t }),
+				h(HeldSection, { market, t }),
 				h(AppSection, { app: snapshot.app, t })
 			);
 		}
@@ -1501,7 +1736,12 @@ window.__ModuleLoader__.load({
 			".dsh-ocu-primary-warn{background:var(--dsw-alias-state-warning-primary,#b07d1a)}",
 			".dsh-ocu-primary-quiet{color:var(--dsw-alias-label-primary,#1c1c1e);background:var(--dsw-alias-interactive-bg-hover,rgba(0,0,0,.06))}",
 			".dsh-ocu-card-foot{margin:2px 0 0;font-size:12px;line-height:1.6;color:var(--dsw-alias-label-secondary,#6b6b70)}",
-			"@media (max-width:560px){.dsh-ocu-page{padding:24px 20px 36px}.dsh-ocu-row{flex-direction:column;align-items:flex-start;gap:4px}.dsh-ocu-row-state{max-width:100%}}",
+			".dsh-ocu-card-held{border-style:dashed}",
+			'.dsh-ocu-card-held .dsh-ocu-card-title{font-weight:500;color:var(--dsw-alias-label-secondary,#6b6b70)}',
+			".dsh-ocu-rows-held{margin-top:0}",
+			".dsh-ocu-row-held{font-size:12px}",
+			".dsh-ocu-row-held .dsh-ocu-row-state{white-space:normal;text-align:right;max-width:46%;overflow:visible;text-overflow:clip;line-height:1.45}",
+			"@media (max-width:560px){.dsh-ocu-page{padding:24px 20px 36px}.dsh-ocu-row{flex-direction:column;align-items:flex-start;gap:4px}.dsh-ocu-row-state{max-width:100%}.dsh-ocu-row-held .dsh-ocu-row-state{text-align:left;max-width:100%}}",
 			"@media (prefers-reduced-motion:reduce){.dsh-ocu-dot,.dsh-ocu-spin{animation:none}}"
 		].join("\n");
 

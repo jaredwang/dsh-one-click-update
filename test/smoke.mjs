@@ -177,6 +177,9 @@ function makeApi(options) {
 		restarts: [],
 		overlays: [],
 		overlayStatus: options.overlayStatus ?? 200,
+		details: options.updatesDetail,
+		detailsStatus: options.updatesDetailStatus ?? 200,
+		detailCalls: 0,
 		async fetch(url, init) {
 			const method = (init && init.method) || "GET";
 			const path = String(url);
@@ -194,6 +197,13 @@ function makeApi(options) {
 				api.summaryCalls += 1;
 				if (api.summaryStatus === 404) return resp(404, { error: "not found" });
 				return resp(200, { schema: "dsh-market/update-api/v1", checked: 7, updatable: api.packages.length, packages: api.packages });
+			}
+			// The market panel's own listing: the client reads it after the summary
+			// for held releases and for the version an update really installs.
+			if (path === "/dsh-market/updates" && method === "GET") {
+				api.detailCalls += 1;
+				if (api.detailsStatus !== 200) return resp(api.detailsStatus, { error: "not found" });
+				return resp(200, { updates: api.details === void 0 ? {} : api.details });
 			}
 			if (path === "/dsh-market/api/v1/updates" && method === "POST") {
 				const name = JSON.parse(init.body).packageName;
@@ -680,6 +690,98 @@ function findButton(node, label) {
 	ok("blocked plugin is summarized", text.includes("1 个需重启后更新"), text.slice(0, 1600));
 	ok("blocked plugin is not retried as a failure", !text.includes("重试失败项"), text.slice(0, 1600));
 	ok("blocked plugin does not reload the page", env.reloads.count === 0, env.reloads.count);
+	view.unmount();
+}
+
+/* ------------------------------------------------------------------ */
+/* Scenario 13 — a held newer release beside a mature update           */
+/* ------------------------------------------------------------------ */
+{
+	const env = await load({
+		appPhase: "idle",
+		packages: [{ name: "alpha", source: "npm", installedVersion: "1.0.0", latestVersion: "1.1.0" }],
+		updatesDetail: {
+			alpha: {
+				updateAvailable: true,
+				current: "1.0.0",
+				latest: "1.1.0",
+				eligibleVersion: "1.0.5",
+				heldUpdate: { latest: "1.1.0", until: "2026-11-16T20:45:23.139Z" }
+			},
+			dshmarket: {
+				updateAvailable: false,
+				current: "1.73.19",
+				latest: "1.73.20",
+				heldUpdate: { latest: "1.73.20", until: "2026-11-16T22:45:23.139Z" }
+			}
+		}
+	});
+	await sleep(80);
+	const entry = env.registered.find((r) => r.options.name === "sidebar.panellist");
+	const page = env.registered.find((r) => r.options.name === "main");
+	const glyph = env.React.mount(entry.component, { t: env.t, size: 16 });
+	ok("market details read once", env.api.detailCalls === 1, env.api.detailCalls);
+	ok("updatable count excludes the held plugin", String(glyph.output.props.title).includes("1 个插件可更新，1 个等待成熟期"), glyph.output.props.title);
+	glyph.unmount();
+	const view = env.React.mount(page.component, { t: env.t });
+	const early = JSON.stringify(view.output);
+	ok("held-only plugin gets its own card", early.includes("dsh-ocu-card-held") && early.includes("dshmarket"), early.slice(0, 1600));
+	ok("updatable row shows the mature target", early.includes("1.0.5"), early.slice(0, 1600));
+	ok("updatable row keeps the held release as a hint", early.includes("1.1.0") && early.includes("仍在成熟期"), early.slice(0, 1600));
+	await sleep(2600);
+	const done = JSON.stringify(view.output);
+	ok("held-only plugin is never posted", JSON.stringify(env.api.posted) === '["alpha"]', JSON.stringify(env.api.posted));
+	ok("held card survives the run", done.includes("dsh-ocu-card-held") && done.includes("dshmarket"), done.slice(0, 1800));
+	ok("held card says when the release clears", done.includes("后可更新") && done.includes("1.73.20"), done.slice(0, 1800));
+	view.unmount();
+}
+
+/* ------------------------------------------------------------------ */
+/* Scenario 14 — only held releases: nothing to post                   */
+/* ------------------------------------------------------------------ */
+{
+	const env = await load({
+		appPhase: "idle",
+		packages: [],
+		updatesDetail: {
+			dshmarket: {
+				updateAvailable: false,
+				current: "1.73.19",
+				latest: "1.73.20",
+				heldUpdate: { latest: "1.73.20" }
+			}
+		}
+	});
+	await sleep(80);
+	const entry = env.registered.find((r) => r.options.name === "sidebar.panellist");
+	const page = env.registered.find((r) => r.options.name === "main");
+	const glyph = env.React.mount(entry.component, { t: env.t, size: 16 });
+	ok("held-only keeps the glyph idle", glyph.output.props["data-tone"] === "idle", glyph.output.props["data-tone"]);
+	ok("held-only tooltip is not 'up to date'", String(glyph.output.props.title).includes("暂无可以更新的插件，1 个等待成熟期"), glyph.output.props.title);
+	glyph.unmount();
+	const view = env.React.mount(page.component, { t: env.t });
+	await sleep(300);
+	const text = JSON.stringify(view.output);
+	ok("held-only page names the category", text.includes("dsh-ocu-card-held") && text.includes("dshmarket"), text.slice(0, 1600));
+	ok("held-only page explains the wait", text.includes("发布满期限后可更新"), text.slice(0, 1600));
+	ok("held-only page offers no run", text.includes("重新检查") && !text.includes("全部更新"), text.slice(0, 1600));
+	ok("held-only posts nothing", env.api.posted.length === 0, JSON.stringify(env.api.posted));
+	ok("held-only does not reload", env.reloads.count === 0, env.reloads.count);
+	view.unmount();
+}
+
+/* ------------------------------------------------------------------ */
+/* Scenario 15 — no details route: plain v1 behaviour                  */
+/* ------------------------------------------------------------------ */
+{
+	const env = await load({ appPhase: "idle", packages: [], updatesDetailStatus: 404 });
+	await sleep(80);
+	const page = env.registered.find((r) => r.options.name === "main");
+	const view = env.React.mount(page.component, { t: env.t });
+	await sleep(300);
+	const text = JSON.stringify(view.output);
+	ok("missing details route says up to date", text.includes("所有插件都是最新版本"), text.slice(0, 1200));
+	ok("missing details route draws no held card", !text.includes("dsh-ocu-card-held"), text.slice(0, 1600));
 	view.unmount();
 }
 

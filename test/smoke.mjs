@@ -699,7 +699,10 @@ function findButton(node, label) {
 {
 	const env = await load({
 		appPhase: "idle",
-		packages: [{ name: "alpha", source: "npm", installedVersion: "1.0.0", latestVersion: "1.1.0" }],
+		packages: [
+			{ name: "alpha", source: "npm", installedVersion: "1.0.0", latestVersion: "1.1.0" },
+			{ name: "beta", source: "npm", installedVersion: "2.0.0", latestVersion: "2.1.0" }
+		],
 		updatesDetail: {
 			alpha: {
 				updateAvailable: true,
@@ -708,6 +711,7 @@ function findButton(node, label) {
 				eligibleVersion: "1.0.5",
 				heldUpdate: { latest: "1.1.0", until: "2026-11-16T20:45:23.139Z" }
 			},
+			beta: { updateAvailable: true, current: "2.0.0", latest: "2.1.0", eligibleVersion: "2.1.0" },
 			dshmarket: {
 				updateAvailable: false,
 				current: "1.73.19",
@@ -721,22 +725,20 @@ function findButton(node, label) {
 	const page = env.registered.find((r) => r.options.name === "main");
 	const glyph = env.React.mount(entry.component, { t: env.t, size: 16 });
 	ok("market details read once", env.api.detailCalls === 1, env.api.detailCalls);
-	ok("updatable count excludes the held plugin", String(glyph.output.props.title).includes("1 个插件可更新，1 个等待成熟期"), glyph.output.props.title);
+	ok("held plugin leaves the update count", String(glyph.output.props.title).includes("1 个插件可更新，2 个等待成熟期"), glyph.output.props.title);
 	glyph.unmount();
 	const view = env.React.mount(page.component, { t: env.t });
 	const early = JSON.stringify(view.output);
-	ok("held-only plugin gets its own card", early.includes("dsh-ocu-card-held") && early.includes("dshmarket"), early.slice(0, 1600));
-	ok("updatable row shows the mature target", early.includes("1.0.5"), early.slice(0, 1600));
-	ok("updatable row keeps the held release as a hint", early.includes("1.1.0") && early.includes("仍在成熟期"), early.slice(0, 1600));
+	ok("held plugins get the held card", early.includes("dsh-ocu-card-held") && early.includes("dshmarket") && early.includes("alpha"), early.slice(0, 1600));
+	ok("held plugin is never offered as an update", !early.includes("1.0.5") && early.includes("2.1.0"), early.slice(0, 1600));
 	await sleep(2600);
 	const done = JSON.stringify(view.output);
-	ok("held-only plugin is never posted", JSON.stringify(env.api.posted) === '["alpha"]', JSON.stringify(env.api.posted));
-	ok("held card survives the run", done.includes("dsh-ocu-card-held") && done.includes("dshmarket"), done.slice(0, 1800));
+	ok("only the unheld plugin is posted", JSON.stringify(env.api.posted) === '["beta"]', JSON.stringify(env.api.posted));
+	ok("held card survives the run", done.includes("dsh-ocu-card-held") && done.includes("dshmarket") && done.includes("1.1.0"), done.slice(0, 1800));
 	ok("held card says when the release clears", done.includes("后可更新") && done.includes("1.73.20"), done.slice(0, 1800));
 	view.unmount();
 }
 
-/* ------------------------------------------------------------------ */
 /* Scenario 14 — only held releases: nothing to post                   */
 /* ------------------------------------------------------------------ */
 {

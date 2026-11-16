@@ -58,8 +58,6 @@ window.__ModuleLoader__.load({
 				"plugins.count": "{count} 个插件可更新",
 				"plugins.countHeld": "{count} 个插件可更新，{held} 个等待成熟期",
 				"plugins.heldOnly": "暂无可以更新的插件，{held} 个等待成熟期",
-				"plugins.heldNote": "部分插件的最新版仍在成熟期，本次先更新到已成熟的版本。",
-				"plugins.heldHint": "最新版 {version} 仍在成熟期，本次先更新到已成熟的版本。",
 				"plugins.unsupported": "未检测到插件市场，无法更新插件",
 				"plugins.error": "检查插件更新失败：{reason}",
 				"plugins.running": "正在更新 {name}（{done}/{total}）",
@@ -146,8 +144,6 @@ window.__ModuleLoader__.load({
 				"plugins.count": "{count} plugins can be updated",
 				"plugins.countHeld": "{count} plugins can be updated, {held} waiting for maturity",
 				"plugins.heldOnly": "Nothing to update; {held} plugins waiting for maturity",
-				"plugins.heldNote": "Some plugins have a newer release still inside the maturity hold; this run installs the mature version instead.",
-				"plugins.heldHint": "Version {version} is still maturing; this run installs the mature release.",
 				"plugins.unsupported": "Plugin market not found, plugins can't be updated",
 				"plugins.error": "Plugin check failed: {reason}",
 				"plugins.running": "Updating {name} ({done}/{total})",
@@ -491,30 +487,20 @@ window.__ModuleLoader__.load({
 			return pkg.latestVersion;
 		}
 
-		/** Annotate v1 rows with the mature target and the newer held release, if any. */
+		/** Annotate v1 rows with the version the market would install. */
 		function annotatePackages(packages, details) {
 			return packages.map((pkg) => {
 				if (details === void 0) return { ...pkg, targetVersion: pkg.latestVersion };
-				const detail = details[pkg.name];
-				const target = targetVersionOf(pkg, detail);
-				const next = { ...pkg, targetVersion: target };
-				const held = detail !== null && typeof detail === "object" ? detail.heldUpdate : void 0;
-				if (held !== null && typeof held === "object" && typeof held.latest === "string" && held.latest !== "" && held.latest !== target) {
-					next.heldVersion = held.latest;
-					if (typeof held.until === "string" && held.until !== "") next.heldUntil = held.until;
-					if (held.estimated === true) next.heldEstimated = true;
-				}
-				return next;
+				return { ...pkg, targetVersion: targetVersionOf(pkg, details[pkg.name]) };
 			});
 		}
 
-		/** Held-only packages: present in the market listing, absent from v1's summary. */
+		/** Every package whose newest release is still inside the maturity hold. */
 		function collectHeld(details) {
 			if (details === void 0) return [];
 			const rows = [];
 			for (const [name, detail] of Object.entries(details)) {
 				if (detail === null || typeof detail !== "object") continue;
-				if (detail.updateAvailable === true) continue;
 				const hold = detail.heldUpdate;
 				if (hold === null || typeof hold !== "object") continue;
 				const version = typeof hold.latest === "string" && hold.latest !== ""
@@ -556,7 +542,19 @@ window.__ModuleLoader__.load({
 			// Read after the summary so the market's cached check (already refreshed
 			// by an explicit recheck) answers without a second network round.
 			const details = await readUpdateDetails();
-			const annotated = annotatePackages(packages, details);
+			// Public API v1 lists a package as updatable whenever the mature
+			// version is newer than the installed one, but it cannot pin that
+			// target: the market answers a bare update with "latest release is
+			// still held". A plugin whose newest release is held therefore belongs
+			// in the waiting category, not in the queue, and moves back into this
+			// list by itself once the hold clears.
+			const heldNames = details === void 0
+				? new Set()
+				: new Set(Object.keys(details).filter((name) => {
+					const detail = details[name];
+					return detail !== null && typeof detail === "object" && detail.heldUpdate !== null && typeof detail.heldUpdate === "object";
+				}));
+			const annotated = annotatePackages(packages.filter((pkg) => !heldNames.has(pkg.name)), details);
 			patchMarket({
 				status: "ready",
 				checked: typeof body.checked === "number" ? body.checked : 0,
@@ -1325,10 +1323,7 @@ window.__ModuleLoader__.load({
 								h("span", { className: "dsh-ocu-arrow", "aria-hidden": "true" }, "\u2192"),
 								h(
 									"span",
-									{
-										className: "dsh-ocu-version dsh-ocu-version-new",
-										title: pkg.heldVersion === void 0 ? void 0 : t("plugins.heldHint", { version: pkg.heldVersion })
-									},
+									{ className: "dsh-ocu-version dsh-ocu-version-new" },
 									pkg.targetVersion === void 0 ? pkg.latestVersion : pkg.targetVersion
 								)
 							)
@@ -1403,13 +1398,7 @@ window.__ModuleLoader__.load({
 				rows.push({
 					name: pkg.name,
 					installedVersion: pkg.installedVersion,
-					heldVersion: pkg.heldVersion === void 0
-						? pkg.targetVersion === void 0
-							? pkg.latestVersion
-							: pkg.targetVersion
-						: pkg.heldVersion,
-					...(pkg.heldUntil === void 0 ? {} : { heldUntil: pkg.heldUntil }),
-					...(pkg.heldEstimated === true ? { heldEstimated: true } : {})
+					heldVersion: pkg.targetVersion === void 0 ? pkg.latestVersion : pkg.targetVersion
 				});
 			}
 			return rows;
@@ -1450,7 +1439,6 @@ window.__ModuleLoader__.load({
 				return result === void 0 || result.status !== "pending";
 			});
 			const showRows = visibleRows.length > 0 && market.status !== "unsupported";
-			const heldAnnotated = market.packages.some((pkg) => pkg.heldVersion !== void 0);
 			const restartNeeded = market.restartRequired === true;
 			// Any successful plugin update changes the client-module release the page
 			// booted from; until it reloads, creating a new session can mix modules of
@@ -1484,7 +1472,6 @@ window.__ModuleLoader__.load({
 			const notes = [];
 			if (restartNeeded) notes.push(t("plugins.restart"));
 			else if (refreshNeeded) notes.push(t("plugins.refreshHint"));
-			if (heldAnnotated) notes.push(t("plugins.heldNote"));
 			const blockedResults = Object.values(market.results).filter((result) => result.status === "blocked");
 			// An old Host has no overlay route; restarting DSH loads it from disk,
 			// so offer the very restart that makes the next run work.

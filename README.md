@@ -12,8 +12,8 @@ A one-click, zero-effort updater for the [DSH](https://github.com/deepseek-ai/de
 
 一次进入更新页 = 一次「全部更新」，顺序固定：
 
-1. **插件市场**：先读插件市场公开的 [Update API v1](https://www.npmjs.com/package/dshmarket)（`GET /dsh-market/api/v1/capabilities` 与 `GET /dsh-market/api/v1/updates/summary`），拿到所有可更新插件；再读市场面板自己的 `GET /dsh-market/updates` 做只读补充——只有它知道哪些插件**单纯处于成熟期**（v1 summary 根本不会列出），以及每个可更新插件真正能装的成熟版本 `eligibleVersion`（最新版可能仍在成熟期）。该接口不可用时自动退回纯 v1 行为。
-2. 对每个可更新插件**串行**发 `POST /dsh-market/api/v1/updates`，然后轮询 `GET /dsh-market/api/v1/operations?operationId=…`（700ms 一次，8 分钟上限），逐行显示 `已安装版本 → 目标版本` 与状态；真正失败的插件显示插件市场返回的失败原因并可点「重试失败项」；**仍在新版本成熟期内的插件单独归入「等待成熟期」分类**——不参与本次更新、不计入可更新数量，也不是失败；卡片里显示待成熟版本和预计可更新时间，等市场放行后重新检查即可更新。可更新插件的最新版若仍在成熟期，它会照常更新到已成熟的 `eligibleVersion`，行内 tooltip 会说明最新版尚未放行。
+1. **插件市场**：先读插件市场公开的 [Update API v1](https://www.npmjs.com/package/dshmarket)（`GET /dsh-market/api/v1/capabilities` 与 `GET /dsh-market/api/v1/updates/summary`），拿到所有可更新插件；再读市场面板自己的 `GET /dsh-market/updates` 做只读补充——只有它知道哪些插件的**最新版**仍在成熟期：只处于成熟期的插件根本不在 v1 summary 里，而最新版被 hold、但还有更旧成熟版本可装的插件会被 v1 列为可更新，这一类同样归入等待分类。该接口不可用时自动退回纯 v1 行为。
+2. 对每个可更新插件**串行**发 `POST /dsh-market/api/v1/updates`，然后轮询 `GET /dsh-market/api/v1/operations?operationId=…`（700ms 一次，8 分钟上限），逐行显示 `已安装版本 → 目标版本` 与状态；真正失败的插件显示插件市场返回的失败原因并可点「重试失败项」；**仍在新版本成熟期内的插件单独归入「等待成熟期」分类**——不参与本次更新、不计入可更新数量，也不是失败；卡片里显示待成熟版本和预计可更新时间，等市场放行后重新检查即可更新。只要某插件的最新版仍在成熟期，它就整体留在等待分类、不发起更新——公开的 v1 更新接口无法锁定更旧的成熟版本（会返回 409「当前最新版仍在等待期」），强行更新只会让它在排队与等待之间来回；等最新版放行后重新检查，它会自动回到可更新列表并直接更新到最新版。需要提前装成熟版本时，请用插件市场面板自己更新。
 **已经挂载（in-use）的插件不会被卡住**：桌面 Host 不允许在插件仍然挂载时热移除，而市场的托管更新是「先移除再安装」，所以这类插件会返回 `bundle-in-use`（原文「这个插件正在使用中，桌面端不允许现在移除」）。遇到这个失败码时，页面自动改走本插件的 `POST /dsh-one-click-update/overlay`：用桌面 Host 的 pnpm 把目标版本**覆盖安装**进 profile（不动已挂载的 loader 行），成功后同样标记「需要重启 DSH」，重启后新版本生效。若 Host 还没有这条路由（旧版插件半部尚未重启），则提示「当前 Host 还不支持覆盖安装」并直接给出「立即重启 DSH」按钮——重启后重新打开本页，它会自动走覆盖安装（也可以按提示手动 `pnpm add`）。
 
 3. **让更新生效**：更新完成后，页面自己处理版本切换——只更新了客户端插件（`refreshRequired`）时自动刷新页面并提示「刷新页面后即可新建会话」（避免新旧两套 client modules 混用导致新建会话报错）；有插件的 Host 半部变了（`restartRequired`）时显示「立即重启 DSH」按钮，一键把桌面 App 退出并重新打开。重启提醒会用 Host 的 `bootId` 记在 `localStorage` 里，**刷新页面也不会丢**；如果同时有 App 更新在跑，页面刷新会让位给 App 自带的更新流程（它自己会重启）。
@@ -44,7 +44,7 @@ A one-click, zero-effort updater for the [DSH](https://github.com/deepseek-ai/de
 | --- | --- | --- |
 | GET | `/dsh-market/api/v1/capabilities` | 探测 API 是否可用、读 `runtime` 与 `features` |
 | GET | `/dsh-market/api/v1/updates/summary` | 一次拿到所有可更新插件（`checked` / `updatable` / `packages`） |
-| GET | `/dsh-market/updates` | 市场面板自己的列表：补齐只处于成熟期的插件与可安装的 `eligibleVersion`（只读补充，失败时退回 v1 视图） |
+| GET | `/dsh-market/updates` | 市场面板自己的列表：识别最新版仍在成熟期的插件，包括 v1 summary 误列为可更新的那些（只读补充，失败时退回纯 v1 视图） |
 | POST | `/dsh-market/api/v1/updates` | 开始更新单个插件（`{packageName, force?}`，202/409/404） |
 | GET | `/dsh-market/api/v1/operations?operationId=` | 轮询进度与终态（succeeded / failed / cancelled / rolled-back） |
 
@@ -65,7 +65,7 @@ A one-click, zero-effort updater for the [DSH](https://github.com/deepseek-ai/de
 - **更新 App 只能在 DSH 桌面 App 内使用**：`window.dshDesktop` 由 Electron preload 注入，纯浏览器打开 `http://127.0.0.1:PORT` 时不存在，页面会显示「更新 DSH 桌面 App 仅在桌面 App 内可用」；此时插件市场的更新仍然可用（同一 Host 源）。
 - **重启靠一个后台助手脚本**：桌面端 preload 没有 quit/relaunch 通道，插件市场自己的 restart 在 desktop 下也被禁用（`restart.supported: false`，`managedBy: "desktop-host"`），所以「立即重启 DSH」由本插件的 Host 路由写一个临时脚本、脱离进程运行：先用 AppleScript 让 App 正常退出，确认主进程退出后再 `open` 重新打开。它**不会强杀**——如果 App 正在跑任务、退出被确认框拦住，助手会放弃并让确认框由你决定。重启入口只在「Host 真的是桌面 App 拉起的」情况下可用（普通 `dsh web` 会得到 501，网页端改用插件市场自己的 restart 接口）。
 - **覆盖安装不是「热更新」**：它只把新版本写到磁盘，正在运行的 Host/页面仍跑旧代码，必须重启 DSH 才生效；之所以这样做，是因为桌面 Host 在插件挂载期间拒绝移除（`bundle-in-use`），而市场托管更新必须先移除。覆盖安装不绕过 market 的成熟期检查（超时/成熟期会如实返回 409），也不改变 profile 里 `dsh.profile.bundles` 的选择。
-- **桌面端可能压住刚发布的新版本**：market 的 `holdYoungReleases` 会让刚发布的版本暂不显示为可更新；此时 summary 的 `updatable` 会少算或为 0，属正常。页面会从 `GET /dsh-market/updates` 把这些插件补进「等待成熟期」分类；该面板接口不可用时退回纯 v1 视图，只是看不到等待分类，不影响正常更新。
+- **桌面端可能压住刚发布的新版本**：market 的 `holdYoungReleases` 会让刚发布的版本暂不显示为可更新；此时 summary 的 `updatable` 会少算或为 0，属正常。页面会从 `GET /dsh-market/updates` 识别这些插件（包括 v1 仍列为可更新、但最新版其实被 hold 的），整体放进「等待成熟期」分类、不发起更新；该面板接口不可用时退回纯 v1 视图，只是看不到等待分类，不影响正常更新。
 - **operation 只活在当前 Host 进程里**：查不到的 operation 会 404（本插件按 “operation lost” 失败处理），重启 Harness 后旧的 operation id 即失效。
 - 当前 DSH App 版本号不在 product API 里（只给 `phase` / `version` / `percent` / `failure`），「当前版本」由桌面端自己的对话框展示。
 
@@ -113,9 +113,16 @@ npm test        # = node test/smoke.mjs && node test/host.mjs
 node --check client.js
 ```
 
-冒烟测试不依赖任何 npm 包：它用一个 mini React 与伪 `fetch` / 伪桌面桥渲染真实的 `client.js`，覆盖自动开始、串行更新、失败重试、**成熟期等待（不是失败）**、**已挂载插件回退覆盖安装（以及 Host 未加载路由时的受阻提示）**、客户端更新后的自动刷新、**一键重启按钮与请求**、无插件市场、无桌面桥，以及成熟期插件独立成类且不参与更新、可更新插件显示真正会安装的成熟版本、旧市场没有面板接口时退回纯 v1 视图、App 状态晚到（慢 `updates.status()`）仍会自动打开更新等路径（95 项断言）。`test/host.mjs` 用假的 `ctx` / request / response 覆盖 macOS / Windows / Linux 的重启脚本、非桌面 Host 的 501、外站 Origin 的 403、重复重启的 409、覆盖安装的参数/版本/依赖/成熟期/落盘校验与并发 409，以及两条路由的注册与清理（72 项断言）。
+冒烟测试不依赖任何 npm 包：它用一个 mini React 与伪 `fetch` / 伪桌面桥渲染真实的 `client.js`，覆盖自动开始、串行更新、失败重试、**成熟期等待（不是失败）**、**已挂载插件回退覆盖安装（以及 Host 未加载路由时的受阻提示）**、客户端更新后的自动刷新、**一键重启按钮与请求**、无插件市场、无桌面桥，以及最新版仍在成熟期的插件独立成类且不参与更新（即使 v1 把它列为可更新）、旧市场没有面板接口时退回纯 v1 视图、App 状态晚到（慢 `updates.status()`）仍会自动打开更新等路径（94 项断言）。`test/host.mjs` 用假的 `ctx` / request / response 覆盖 macOS / Windows / Linux 的重启脚本、非桌面 Host 的 501、外站 Origin 的 403、重复重启的 409、覆盖安装的参数/版本/依赖/成熟期/落盘校验与并发 409，以及两条路由的注册与清理（72 项断言）。
 
 ## 更新说明
+
+### 0.5.1
+
+- 修复：最新版仍在成熟期的插件在「重新检查」后反复出现在排队中。0.5.0 把这类插件当作可更新、目标取 `eligibleVersion`，但公开的 `POST /dsh-market/api/v1/updates` 只接受 `packageName` / `force`，无法锁定更旧的成熟版本，市场会返回 409「当前最新版仍在等待期」；页面先显示排队，再把它挪进等待分类，重新检查后循环复现。
+- 现在：只要 `GET /dsh-market/updates` 显示某插件有 `heldUpdate`（最新版仍在成熟期），该插件就整体归入「等待成熟期」——不进入可更新列表、不计入 `updatable`、不发起更新，也不会被「全部更新」或「重试失败项」选中；最新版放行后重新检查，它会自动回到可更新列表并直接更新到最新版。
+- 取舍：不再通过本插件安装 `eligibleVersion`（例如最新版 0.85.1 被 hold 时先装 0.84.1）——公开接口不支持这种目标锁定；需要提前装成熟版本时请用插件市场面板。等待分类仍显示待成熟版本与预计可更新时间。
+- 兼容与测试：面板接口不可用时退回纯 v1 行为；运行中才出现的成熟期结果仍归入等待分类、不会变成可重试失败。`test/smoke.mjs` 更新混合场景断言（被 hold 的插件不发请求、不在可更新列表），共 94 项断言。
 
 ### 0.5.0
 

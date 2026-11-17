@@ -174,6 +174,18 @@ function makeApi(options) {
 		holdNames: options.holdNames ?? [],
 		restartNames: options.restartNames ?? [],
 		inUseNames: options.inUseNames ?? [],
+		// The market's lock: how many POSTs answer 409 "busy" before it accepts one.
+		busyNames: options.busyNames ?? {},
+		// The market re-applied itself mid-run: the first poll finds no operation.
+		lostNames: options.lostNames ?? [],
+		// Same, but the install really did not land (the forced check still offers it).
+		lostPendingNames: options.lostPendingNames ?? [],
+		// The busy sentence arrives through the operation result, not the POST.
+		busyOpNames: options.busyOpNames ?? [],
+		busyLeft: new Map(),
+		lostServed: new Set(),
+		opBusyServed: new Set(),
+		installedCalls: [],
 		restarts: [],
 		overlays: [],
 		overlayStatus: options.overlayStatus ?? 200,
@@ -205,9 +217,46 @@ function makeApi(options) {
 				if (api.detailsStatus !== 200) return resp(api.detailsStatus, { error: "not found" });
 				return resp(200, { updates: api.details === void 0 ? {} : api.details });
 			}
+			// The single-package form of v1: the client asks it after an operation
+			// record vanished, to learn what is on disk now.
+			if (path.startsWith("/dsh-market/api/v1/updates?") && method === "GET") {
+				const name = decodeURIComponent((path.match(/[?&]name=([^&]*)/) || [])[1] || "");
+				api.installedCalls.push(name);
+				const known = api.packages.find((pkg) => pkg.name === name);
+				if (known === undefined) return resp(404, { error: "plugin is not installed" });
+				if (api.lostPendingNames.indexOf(name) !== -1) {
+					return resp(200, {
+						schema: "dsh-market/update-api/v1",
+						package: {
+							name,
+							source: known.source,
+							installedVersion: known.installedVersion,
+							latestVersion: known.latestVersion,
+							updateAvailable: true
+						}
+					});
+				}
+				return resp(200, {
+					schema: "dsh-market/update-api/v1",
+					package: {
+						name,
+						source: known.source,
+						installedVersion: known.latestVersion,
+						latestVersion: known.latestVersion,
+						updateAvailable: false
+					}
+				});
+			}
 			if (path === "/dsh-market/api/v1/updates" && method === "POST") {
 				const name = JSON.parse(init.body).packageName;
 				api.posted.push(name);
+				const left = api.busyNames[name] === undefined ? 0 : api.busyNames[name];
+				api.busyLeft.set(name, left);
+				if (left > 0) {
+					// What the lock answers while another operation is still running.
+					api.busyNames[name] = left - 1;
+					return resp(409, { failureCode: "OPERATION_BUSY", busy: true, error: "another plugin operation is running" });
+				}
 				return resp(202, { operation: { operationId: "op-" + name } });
 			}
 			if (path === "/dsh-one-click-update/restart" && method === "POST") {
@@ -229,7 +278,18 @@ function makeApi(options) {
 				const id = decodeURIComponent(path.split("=")[1]);
 				const n = (api.polls[id] = (api.polls[id] || 0) + 1);
 				const name = id.slice(3);
+				// A re-applied market keeps the install but loses the record; only the
+				// first poll of a lost operation sees the 404.
+				if (api.lostNames.indexOf(name) !== -1 && api.lostServed.has(name) === false) {
+					api.lostServed.add(name);
+					return resp(404, { schema: "dsh-market/update-api/v1", error: "operation not found in this host process" });
+				}
 				if (n < 2) return resp(200, { operation: { operationId: id, state: "running", percent: 55 } });
+				// The busy sentence delivered through the operation result, once.
+				if (api.busyOpNames.indexOf(name) !== -1 && api.opBusyServed.has(name) === false) {
+					api.opBusyServed.add(name);
+					return resp(200, { operation: { operationId: id, state: "failed", failure: { message: "another plugin operation is running" } } });
+				}
 				if (api.holdNames.indexOf(name) !== -1) {
 					// What the market really answers for a maturity hold: a failed
 					// operation whose 409 body carried no `stale` flag, so the v1 API
@@ -784,6 +844,98 @@ function findButton(node, label) {
 	const text = JSON.stringify(view.output);
 	ok("missing details route says up to date", text.includes("所有插件都是最新版本"), text.slice(0, 1200));
 	ok("missing details route draws no held card", !text.includes("dsh-ocu-card-held"), text.slice(0, 1600));
+	view.unmount();
+}
+
+/* ------------------------------------------------------------------ */
+/* Scenario 16 — the operation record vanished, the install landed      */
+/* ------------------------------------------------------------------ */
+{
+	const env = await load({
+		appPhase: "idle",
+		packages: [{ name: "alpha", source: "npm", installedVersion: "1.0.0", latestVersion: "1.1.0" }],
+		lostNames: ["alpha"]
+	});
+	await sleep(80);
+	const page = env.registered.find((r) => r.options.name === "main");
+	const view = env.React.mount(page.component, { t: env.t });
+	await sleep(1600);
+	const text = JSON.stringify(view.output);
+	ok("lost record is checked against disk", JSON.stringify(env.api.installedCalls) === '["alpha"]', JSON.stringify(env.api.installedCalls));
+	ok("lost record that landed is a success", text.includes("已更新到 1.1.0"), text.slice(0, 1400));
+	ok("landed install is not posted twice", JSON.stringify(env.api.posted) === '["alpha"]', JSON.stringify(env.api.posted));
+	ok("landed install asks for a restart", text.includes("需要重启"), text.slice(0, 1600));
+	ok("landed install shows no raw 404 sentence", !text.includes("operation not found"), text.slice(0, 1600));
+	ok("landed install is not a failure", !text.includes("失败："), text.slice(0, 1600));
+	view.unmount();
+}
+
+/* ------------------------------------------------------------------ */
+/* Scenario 17 — the record vanished and the install did not land       */
+/* ------------------------------------------------------------------ */
+{
+	const env = await load({
+		appPhase: "idle",
+		packages: [{ name: "alpha", source: "npm", installedVersion: "1.0.0", latestVersion: "1.1.0" }],
+		lostNames: ["alpha"],
+		lostPendingNames: ["alpha"]
+	});
+	await sleep(80);
+	const page = env.registered.find((r) => r.options.name === "main");
+	const view = env.React.mount(page.component, { t: env.t });
+	await sleep(2600);
+	const text = JSON.stringify(view.output);
+	ok("unlanded record is checked on disk", JSON.stringify(env.api.installedCalls) === '["alpha"]', JSON.stringify(env.api.installedCalls));
+	ok("unlanded record is started again", JSON.stringify(env.api.posted) === '["alpha","alpha"]', JSON.stringify(env.api.posted));
+	ok("restarted update finishes", text.includes("已更新到 9.9.9"), text.slice(0, 1400));
+	ok("restarted update shows no raw 404 sentence", !text.includes("operation not found"), text.slice(0, 1600));
+	view.unmount();
+}
+
+/* ------------------------------------------------------------------ */
+/* Scenario 18 — the busy lock is waited out, not reported              */
+/* ------------------------------------------------------------------ */
+{
+	const env = await load({
+		appPhase: "idle",
+		packages: [{ name: "alpha", source: "npm", installedVersion: "1.0.0", latestVersion: "1.1.0" }],
+		busyNames: { alpha: 2 }
+	});
+	await sleep(80);
+	const page = env.registered.find((r) => r.options.name === "main");
+	const view = env.React.mount(page.component, { t: env.t });
+	await sleep(900);
+	const waiting = JSON.stringify(view.output);
+	ok("busy lock shows a wait, not a stall", waiting.includes("等待其他更新结束"), waiting.slice(0, 1200));
+	ok("busy lock is not shown as a failure", !waiting.includes("another plugin operation is running"), waiting.slice(0, 1400));
+	await sleep(5000);
+	const text = JSON.stringify(view.output);
+	ok("busy lock is retried", JSON.stringify(env.api.posted) === '["alpha","alpha","alpha"]', JSON.stringify(env.api.posted));
+	ok("busy lock ends as updated", text.includes("已更新到 9.9.9"), text.slice(0, 1400));
+	ok("busy lock leaves no failure text", !text.includes("失败："), text.slice(0, 1600));
+	view.unmount();
+}
+
+/* ------------------------------------------------------------------ */
+/* Scenario 19 — the busy sentence arrives via the operation result     */
+/* ------------------------------------------------------------------ */
+{
+	const env = await load({
+		appPhase: "idle",
+		packages: [{ name: "alpha", source: "npm", installedVersion: "1.0.0", latestVersion: "1.1.0" }],
+		busyOpNames: ["alpha"]
+	});
+	await sleep(80);
+	const page = env.registered.find((r) => r.options.name === "main");
+	const view = env.React.mount(page.component, { t: env.t });
+	await sleep(3200);
+	const text = JSON.stringify(view.output);
+	ok("operation-level busy is retried", JSON.stringify(env.api.posted) === '["alpha","alpha"]', JSON.stringify(env.api.posted));
+	ok("operation-level busy ends as updated", text.includes("已更新到 9.9.9"), text.slice(0, 1400));
+	ok("operation-level busy leaves no raw sentence", !text.includes("another plugin operation is running"), text.slice(0, 1600));
+	const zh = env.dicts["dsh-one-click-update"].zh;
+	const en = env.dicts["dsh-one-click-update"].en;
+	ok("busy and lost have their own sentences", typeof zh["plugins.busy"] === "string" && typeof zh["plugins.lost"] === "string" && typeof en["plugins.lost"] === "string");
 	view.unmount();
 }
 

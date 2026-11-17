@@ -67,6 +67,9 @@ window.__ModuleLoader__.load({
 				"plugins.updating": "正在更新…",
 				"plugins.installed": "已更新到 {version}",
 				"plugins.failed": "失败：{reason}",
+				"plugins.lost": "更新记录已失效（插件市场在更新过程中重新加载），未能确认安装结果；请重新检查后再试。",
+				"plugins.busyNote": "插件市场一直在忙（另一个更新尚未结束），请稍后点「重试失败项」。",
+				"plugins.waiting": "等待其他更新结束…",
 				"plugins.cancelled": "已取消",
 				"plugins.rolled": "已回滚",
 				"plugins.blocked": "正在使用中，需重启后更新",
@@ -153,6 +156,9 @@ window.__ModuleLoader__.load({
 				"plugins.updating": "Updating…",
 				"plugins.installed": "Updated to {version}",
 				"plugins.failed": "Failed: {reason}",
+				"plugins.lost": "The update record was lost (the plugin market reloaded mid-update), so the result could not be confirmed. Check again and retry.",
+				"plugins.busyNote": "The plugin market stayed busy (another update is still running). Retry the failed ones in a moment.",
+				"plugins.waiting": "Waiting for another update to finish…",
 				"plugins.cancelled": "Cancelled",
 				"plugins.rolled": "Rolled back",
 				"plugins.blocked": "In use — needs a restart",
@@ -601,15 +607,61 @@ window.__ModuleLoader__.load({
 			};
 		}
 
-		/** True when a 409 response is the maturity hold instead of a busy lock. */
-		function isHeld(res) {
-			const body = res.body !== null && typeof res.body === "object" ? res.body : void 0;
-			if (body === void 0) return false;
-			const failure = body.failure !== null && typeof body.failure === "object" ? body.failure : void 0;
-			const code = failure !== void 0 ? failure.code : void 0;
-			const message = failure !== void 0 ? failure.message : body.error;
-			if (maturityHold(code, message)) return true;
-			return body.stale === true && body.staleReason === "release-age";
+		/**
+		 * The market's lock answers "busy" while an operation of another kind is
+		 * still running: the row before this one is being installed, the market is
+		 * draining pending updates, or the shell is re-applying the profile. Nothing
+		 * about this package failed — the queue just has to wait for the lock — and
+		 * the market says so with `busy: true` or `failure.code === "OPERATION_BUSY"`
+		 * plus one of two sentences. Both are recognised, because the sentence is
+		 * what reaches the operation result.
+		 */
+		const BUSY_TEXT = /another plugin operation is running|another install is already running|another public update operation|operation is already running|OPERATION_BUSY/i;
+		const BUSY_CODE = /^(OPERATION_BUSY|OPERATION_IN_PROGRESS|LOCKED)$/;
+
+		function busyFailure(code, message) {
+			if (typeof code === "string" && BUSY_CODE.test(code) === true) return true;
+			return typeof message === "string" && BUSY_TEXT.test(message);
+		}
+
+		/**
+		 * The market keeps its update operations in its own process (its capability
+		 * document says `operationRetention: "current-process"`). Installing a plugin
+		 * re-applies the profile, so the market can be re-created in the middle of the
+		 * operation it started: the record is gone and the poll answers 404 while the
+		 * install itself may well have landed. Ask the listing what is on disk instead
+		 * of trusting the missing record. `force=1` bypasses the market's 30-minute
+		 * check cache, which an interrupted install may have left stale.
+		 */
+		async function installedNow(name) {
+			const res = await apiGet(API + "/updates?name=" + encodeURIComponent(name) + "&force=1");
+			if (res.status !== 200 || res.body === null || typeof res.body !== "object") return void 0;
+			const pkg = res.body.package;
+			if (pkg === null || typeof pkg !== "object") return void 0;
+			return {
+				installedVersion: typeof pkg.installedVersion === "string" ? pkg.installedVersion : void 0,
+				updateAvailable: pkg.updateAvailable === true
+			};
+		}
+
+		/**
+		 * Did an operation whose record vanished still install? A package the market
+		 * no longer offers an update for has reached its target; a package sitting on
+		 * the target version has too, even while a newer release is held.
+		 */
+		async function landed(pkg, target) {
+			const now = await installedNow(pkg.name);
+			if (now === void 0 || now.installedVersion === void 0) return void 0;
+			const reached = now.updateAvailable !== true || (typeof target === "string" && now.installedVersion === target);
+			if (reached === false) return void 0;
+			return {
+				status: "done",
+				installedVersion: now.installedVersion,
+				// The operation's own verdict went with its record, and a hot swap
+				// cannot be proven from here, so the conservative answer is a restart.
+				restartRequired: true,
+				refreshRequired: false
+			};
 		}
 
 		/**
@@ -686,8 +738,10 @@ window.__ModuleLoader__.load({
 				await sleep(700);
 				const res = await apiGet(API + "/operations?operationId=" + encodeURIComponent(operationId));
 				if (res.status === 404) {
-					// operations live in the host process; a restart loses them
-					return { status: "failed", error: (res.body && res.body.error) || "operation lost" };
+					// The operation record lives in the market's process: a re-applied
+					// market drops it. The caller verifies the install on disk and, when
+					// the update really did not land, starts it again.
+					return { status: "lost", error: (res.body && res.body.error) || "operation lost" };
 				}
 				if (res.status !== 200 || res.body === void 0 || res.body.operation === void 0) {
 					if (Date.now() > deadline) return { status: "failed", error: "timeout" };
@@ -727,24 +781,55 @@ window.__ModuleLoader__.load({
 			}
 		}
 
+		/** Retry budget for an update that is only waiting for the market. */
+		const RETRY_BUDGET_MS = 3 * 60 * 1000;
+		const RETRY_DELAYS_MS = [1000, 2000, 4000, 8000];
+
+		function retryDelay(attempt) {
+			return RETRY_DELAYS_MS[Math.min(attempt, RETRY_DELAYS_MS.length - 1)];
+		}
+
 		/**
-		 * Update one plugin through the market API. A 409 usually means the market
-		 * is still busy with another operation, so it is retried — except when the
-		 * 409 carries the maturity hold, which no retry can clear.
+		 * Update one plugin through the market API. Two answers mean "not now"
+		 * rather than "failed": the lock is busy with another operation, and the
+		 * operation record vanished because the market re-applied itself mid-run.
+		 * Both are waited out inside one budget — a vanished record is first checked
+		 * against disk, since that install may well have landed — and only then
+		 * reported, with a sentence that tells the user what to do next.
 		 */
 		async function updateOne(pkg) {
-			let attempts = 0;
+			const target = pkg.targetVersion === void 0 ? pkg.latestVersion : pkg.targetVersion;
+			const deadline = Date.now() + RETRY_BUDGET_MS;
+			let attempt = 0;
 			for (;;) {
 				const res = await apiPost(API + "/updates", { packageName: pkg.name });
+				let outcome;
 				if (res.status === 202 && res.body && res.body.operation) {
-					return await recoverInUse(pkg, await pollOperation(res.body.operation.operationId, pkg.name));
+					outcome = await pollOperation(res.body.operation.operationId, pkg.name);
+					if (outcome.status === "lost") {
+						const installed = await landed(pkg, target);
+						if (installed !== void 0) return await recoverInUse(pkg, installed);
+						outcome = { status: "failed", code: "OPERATION_LOST", error: outcome.error };
+					}
+				} else {
+					outcome = outcomeOf(res);
 				}
-				const outcome = outcomeOf(res);
-				if (outcome.status === "pending" || isHeld(res) || res.status !== 409 || attempts >= 6) {
-					return await recoverInUse(pkg, outcome);
+				const wait = outcome.status === "failed"
+					&& (outcome.code === "OPERATION_LOST" || busyFailure(outcome.code, outcome.error) === true);
+				if (wait !== true) return await recoverInUse(pkg, outcome);
+				if (Date.now() >= deadline) {
+					return await recoverInUse(pkg, {
+						...outcome,
+						reasonKey: outcome.code === "OPERATION_LOST" ? "plugins.lost" : "plugins.busyNote",
+						retryable: true
+					});
 				}
-				attempts += 1;
-				await sleep(1500);
+				// A wait of up to three minutes must not look like a stuck update:
+				// the row says what it is waiting for while the lock drains.
+				patchMarket({ waiting: pkg.name });
+				await sleep(retryDelay(attempt));
+				patchMarket({ waiting: void 0 });
+				attempt += 1;
 			}
 		}
 
@@ -803,6 +888,7 @@ window.__ModuleLoader__.load({
 				running: false,
 				finished: true,
 				current: void 0,
+				waiting: void 0,
 				percent: void 0,
 				restartRequired,
 				refreshRequired,
@@ -1045,6 +1131,7 @@ window.__ModuleLoader__.load({
 		function describePlugins(market, t) {
 			const held = market.held.length;
 			if (market.running) {
+				if (market.waiting !== void 0) return t("plugins.waiting");
 				const done = Object.keys(market.results).filter((name) => market.results[name].status !== "pending").length;
 				const total = market.packages.filter((pkg) => {
 					const result = market.results[pkg.name];
@@ -1278,6 +1365,10 @@ window.__ModuleLoader__.load({
 						stateText = t("plugins.updating");
 						tone = "active";
 					}
+					if (market.waiting === pkg.name && result === void 0) {
+						stateText = t("plugins.waiting");
+						tone = "active";
+					}
 					if (market.overlay === pkg.name && result === void 0) {
 						stateText = t("plugins.overlayWorking");
 						tone = "active";
@@ -1298,7 +1389,12 @@ window.__ModuleLoader__.load({
 							stateTitle = result.error;
 							tone = "warn";
 						} else if (result.status === "failed") {
-							stateText = t("plugins.failed", { reason: result.error === void 0 ? "?" : result.error });
+							const reason = typeof result.reasonKey === "string"
+								? t(result.reasonKey)
+								: result.error === void 0
+									? "?"
+									: result.error;
+							stateText = t("plugins.failed", { reason });
 							stateTitle = result.error;
 							tone = "error";
 						} else if (result.status === "cancelled") {

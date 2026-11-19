@@ -10,6 +10,7 @@ import { join } from "node:path";
 import {
 	OVERLAY_PATH,
 	PLUGIN_NAME,
+	RELEASE_AGE_OVERRIDE,
 	RESTART_PATH,
 	apply,
 	compareVersions,
@@ -73,7 +74,19 @@ const MAC_EXEC = "/Applications/DeepSeek Harness.app/Contents/MacOS/DeepSeek Har
 	ok("macOS plan keeps the bundle id", darwin.bundleId === "com.deepseek.dsh", darwin.bundleId);
 	ok("macOS script asks the app to quit", darwin.script.includes(`tell application id "com.deepseek.dsh" to quit`), darwin.script);
 	ok("macOS script waits for the shell pid", darwin.script.includes("PID=4242") && darwin.script.includes('kill -0 "$PID"'), darwin.script);
-	ok("macOS script opens the app again", darwin.script.includes('/usr/bin/open "$APP"'), darwin.script);
+	ok("macOS script opens the app again", darwin.script.includes('open_app -a "$APP"'), darwin.script);
+	ok("macOS script retries in rounds", darwin.script.includes('while [ "$round" -lt 2 ]') && darwin.script.includes("try_open open_app -a"), darwin.script);
+	ok("macOS script asks LaunchServices whether the app runs", darwin.script.includes('/usr/bin/lsappinfo find bundleID="$BUNDLE"'), darwin.script);
+	ok("macOS script tries a new instance before giving up", darwin.script.includes('try_open open_app -n -a "$APP"'), darwin.script);
+	ok("macOS script opens by bundle id too", darwin.script.includes('try_open open_app -b "$BUNDLE"'), darwin.script);
+	ok("macOS script strips Electron runtime variables before reopening", darwin.script.includes("-u ELECTRON_RUN_AS_NODE") && darwin.script.includes("-u NODE_OPTIONS"), darwin.script);
+	ok(
+		"macOS script does not report a short-lived app as success",
+		darwin.script.includes("showed up and went away again") && darwin.script.includes("\t\treturn 1"),
+		darwin.script
+	);
+	ok("macOS script watches the whole bundle", darwin.script.includes('/usr/bin/pgrep -f "$APP/Contents/MacOS/"'), darwin.script);
+	ok("macOS script logs its decisions", darwin.script.includes("dsh-one-click-update-restart.log") && darwin.script.includes("say \"app is gone"), darwin.script);
 	ok("macOS script removes itself", darwin.script.includes('trap '), darwin.script);
 
 	const noBundle = restartPlan({
@@ -155,6 +168,11 @@ const plan = () => ({
 		capabilityBody.restart && capabilityBody.restart.supported === true && capabilityBody.restart.script === undefined,
 		capability.body
 	);
+	ok(
+		"GET points at the helper log",
+		typeof capabilityBody.log === "string" && capabilityBody.log.endsWith("dsh-one-click-update-restart.log"),
+		capability.body
+	);
 
 	const dry = fakeResponse();
 	await handler(fakeRequest("POST", RESTART_PATH + "?dryRun=1"), dry);
@@ -169,6 +187,11 @@ const plan = () => ({
 	const started = fakeResponse();
 	await handler(fakeRequest("POST", RESTART_PATH), started);
 	ok("POST starts the helper", started.status === 202 && jsonBody(started).helper === "/tmp/helper.sh", started.body);
+	ok(
+		"POST points at the helper log",
+		typeof jsonBody(started).log === "string" && jsonBody(started).log.endsWith("dsh-one-click-update-restart.log"),
+		started.body
+	);
 	ok("POST launched once", launches === 1, launches);
 
 	const whileBusy = fakeResponse();
@@ -227,18 +250,75 @@ const plan = () => ({
 }
 
 {
-	const missing = describeOverlayTarget(undefined);
-	ok("no profile context means no overlay", missing.available === false && missing.reason === "not-desktop-host", missing);
-	const noManager = describeOverlayTarget({ get: () => ({ profileDirectory: "/tmp/p" }) });
-	ok("a context without a package manager is refused", noManager.available === false, noManager);
+	const missing = describeOverlayTarget(undefined, { execPath: "/usr/bin/node", exists: () => false });
+	ok(
+		"no profile context means no overlay",
+		missing.available === false && missing.reason === "no-profile-directory",
+		missing
+	);
+	const noManager = describeOverlayTarget({ get: () => ({ dir: "/tmp/p" }) }, { execPath: "/usr/bin/node", exists: () => false });
+	ok(
+		"a context without a package manager and without a bundled pnpm is refused",
+		noManager.available === false && noManager.reason === "no-package-manager",
+		noManager
+	);
 	const described = describeOverlayTarget({
-		get: () => ({ packageManager: { command: "/x/pnpm", args: ["--dir"], env: { PATH: "/x" } }, profileDirectory: "/tmp/p", profile: "desktop" })
+		get: () => ({ packageManager: { command: "/x/pnpm", args: ["--dir"], env: { PATH: "/x" } }, dir: "/tmp/p", profile: "desktop" })
 	});
 	ok("the published invocation is used", described.available === true && described.profile === "desktop", described);
 	ok(
 		"the invocation keeps its own argv",
 		described.invocation.command === "/x/pnpm" && described.invocation.args[0] === "--dir",
 		described.invocation
+	);
+	ok("the directory comes from `dir`", described.directory === "/tmp/p", described.directory);
+	ok("the source says the host published it", described.source === "host", described.source);
+	const legacy = describeOverlayTarget({
+		get: () => ({ packageManager: { command: "/x/pnpm" }, profileDirectory: "/tmp/legacy" })
+	});
+	ok("an older profileDirectory still resolves", legacy.available === true && legacy.directory === "/tmp/legacy", legacy);
+	const bundled = describeOverlayTarget(
+		{ get: () => ({ dir: "/tmp/p" }) },
+		{
+			execPath: "/Applications/App.app/Contents/MacOS/App",
+			exists: (candidate) => candidate.endsWith("pnpm/bin/pnpm.mjs")
+		}
+	);
+	ok(
+		"the desktop payload is used when the Host publishes none",
+		bundled.available === true && bundled.source === "bundled",
+		bundled
+	);
+	ok(
+		"the bundled invocation runs the app binary as node",
+		bundled.invocation.command === "/Applications/App.app/Contents/MacOS/App" &&
+			bundled.invocation.args[0] === "--expose-internals" &&
+			bundled.invocation.env.ELECTRON_RUN_AS_NODE === "1",
+		bundled.invocation
+	);
+	const reserved = describeOverlayTarget(
+		{ get: () => ({}) },
+		{
+			execPath: "/Applications/App.app/Contents/MacOS/App",
+			home: "/tmp/dsh-home",
+			exists: (candidate) =>
+				candidate.endsWith("pnpm/bin/pnpm.mjs") || candidate === "/tmp/dsh-home/profiles/desktop/package.json"
+		}
+	);
+	ok(
+		"a packaged app Host falls back to its reserved desktop profile",
+		reserved.available === true && reserved.directory === "/tmp/dsh-home/profiles/desktop",
+		reserved
+	);
+	ok("the reserved profile names the profile too", reserved.profile === void 0, reserved.profile);
+	const outsideApp = describeOverlayTarget(
+		{ get: () => ({}) },
+		{ execPath: "/usr/bin/node", exists: () => false }
+	);
+	ok(
+		"no packaged app means no reserved profile guess",
+		outsideApp.available === false && outsideApp.reason === "no-profile-directory",
+		outsideApp
 	);
 }
 
@@ -332,6 +412,35 @@ function fakeStreamRequest(method, url, headers, payload) {
 		foreign
 	);
 	ok("a foreign origin cannot overlay", foreign.status === 403, foreign.body);
+}
+
+/* The skip-hold switch: one install may lift pnpm's release-age wait. */
+{
+	const forcedRuns = [];
+	const handler = createOverlayHandler({
+		target: overlayTarget,
+		run: async (current, args) => {
+			forcedRuns.push(args);
+			const version = args[1].slice(args[1].lastIndexOf("@") + 1);
+			writeProfile(version);
+			writeInstalled(version);
+			return { exitCode: 0, stdout: "", stderr: "", timedOut: false };
+		}
+	});
+	const capability = fakeResponse();
+	await handler(fakeRequest("GET", OVERLAY_PATH), capability);
+	ok("the Host advertises the release-age override", jsonBody(capability).force === true, capability.body);
+	const res = fakeResponse();
+	await handler(fakeRequest("POST", OVERLAY_PATH, {}, { name: "dsh-better-sidebar", version: "0.30.4", force: true }), res);
+	const body = jsonBody(res);
+	ok("a forced overlay install is accepted", res.status === 200 && body.ok === true, res.body);
+	ok(
+		"a forced install lifts the wait for that one call",
+		forcedRuns.length === 1 &&
+			JSON.stringify(forcedRuns[0]) === JSON.stringify(["add", "dsh-better-sidebar@0.30.4", "--save-exact", RELEASE_AGE_OVERRIDE]),
+		JSON.stringify(forcedRuns)
+	);
+	ok("a forced install reports the override", body.forced === true && body.releaseAgeOverride === RELEASE_AGE_OVERRIDE, res.body);
 }
 
 {

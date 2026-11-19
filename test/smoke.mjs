@@ -189,13 +189,32 @@ function makeApi(options) {
 		restarts: [],
 		overlays: [],
 		overlayStatus: options.overlayStatus ?? 200,
+		// Whether this fake Host advertises the release-age override (index.js).
+		overlayForce: options.overlayForce ?? false,
+		// Pretend pnpm still holds the release even with the override.
+		overlayHold: options.overlayHold ?? false,
+		// A Host half older than the switch: the capability document has no `force`.
+		overlayLegacy: options.overlayLegacy ?? false,
 		details: options.updatesDetail,
 		detailsStatus: options.updatesDetailStatus ?? 200,
 		detailCalls: 0,
+		// Capability calls that fail (the Host is still reloading) before it answers.
+		probeBusy: options.probeBusy ?? 0,
+		// Earlier capability calls that must answer anyway (the page's own startup load).
+		probeSkip: options.probeSkip ?? 0,
+		probeFailures: 0,
 		async fetch(url, init) {
 			const method = (init && init.method) || "GET";
 			const path = String(url);
 			if (path.startsWith("/dsh-market/api/v1/capabilities")) {
+				// A Host that has not finished reloading: the plugin's settle probe
+				// fails and must wait for an answer instead of opening right away.
+				if (api.probeSkip > 0) api.probeSkip -= 1;
+				else if (api.probeBusy > 0) {
+					api.probeBusy -= 1;
+					api.probeFailures += 1;
+					return Promise.reject(new Error("host is reloading"));
+				}
 				return resp(200, {
 					schema: "dsh-market/update-api/v1",
 					apiVersion: 1,
@@ -263,6 +282,17 @@ function makeApi(options) {
 				api.restarts.push(path);
 				return resp(202, { ok: true, helper: "/tmp/helper.sh", restart: { supported: true, mode: "osascript" } });
 			}
+			if (path === "/dsh-one-click-update/overlay" && method === "GET") {
+				// An older Host answers the capability document without `force` at
+				// all; the page reads that absence as "update the Host half".
+				if (api.overlayLegacy === true) return resp(200, { ok: true, overlay: true });
+				return resp(200, {
+					ok: true,
+					overlay: true,
+					force: api.overlayForce,
+					releaseAgeOverride: api.overlayForce ? "--config.minimum-release-age=0" : undefined
+				});
+			}
 			if (path === "/dsh-one-click-update/overlay" && method === "POST") {
 				const payload = JSON.parse(init.body);
 				api.overlays.push(payload);
@@ -272,7 +302,22 @@ function makeApi(options) {
 						hint: "restart DSH to load this route, or run pnpm add " + payload.name + "@" + payload.version
 					});
 				}
-				return resp(200, { ok: true, name: payload.name, version: payload.version, from: "0.28.2", restartRequired: true });
+				if (api.overlayHold) {
+					// pnpm's own refusal after the profile's minimumReleaseAge check.
+					return resp(409, {
+						ok: false,
+						code: "RELEASE_TOO_FRESH",
+						error: "the release is too fresh (release age held)"
+					});
+				}
+				return resp(200, {
+					ok: true,
+					name: payload.name,
+					version: payload.version,
+					from: "0.28.2",
+					restartRequired: true,
+					...(payload.force === true ? { forced: true, releaseAgeOverride: "--config.minimum-release-age=0" } : {})
+				});
 			}
 			if (path.startsWith("/dsh-market/api/v1/operations?operationId=")) {
 				const id = decodeURIComponent(path.split("=")[1]);
@@ -366,6 +411,8 @@ async function load(options) {
 		console,
 		setTimeout,
 		clearTimeout,
+		AbortController,
+		AbortSignal,
 		Promise,
 		Math,
 		JSON,
@@ -936,6 +983,264 @@ function findButton(node, label) {
 	const zh = env.dicts["dsh-one-click-update"].zh;
 	const en = env.dicts["dsh-one-click-update"].en;
 	ok("busy and lost have their own sentences", typeof zh["plugins.busy"] === "string" && typeof zh["plugins.lost"] === "string" && typeof en["plugins.lost"] === "string");
+	view.unmount();
+}
+
+/* ------------------------------------------------------------------ */
+/* Scenario 20 — the skip-hold switch installs a held release now       */
+/* ------------------------------------------------------------------ */
+{
+	const env = await load({
+		appPhase: "idle",
+		packages: [],
+		overlayForce: true,
+		storage: { "dsh-one-click-update:skip-hold": "1" },
+		updatesDetail: {
+			dshmarket: {
+				updateAvailable: false,
+				current: "1.73.19",
+				latest: "1.73.20",
+				heldUpdate: { latest: "1.73.20", until: "2026-11-16T22:45:23.139Z" }
+			}
+		}
+	});
+	await sleep(80);
+	const page = env.registered.find((r) => r.options.name === "main");
+	const view = env.React.mount(page.component, { t: env.t });
+	await sleep(200);
+	const early = JSON.stringify(view.output);
+	ok("the skip switch is drawn", early.includes("跳过冷静期"), early.slice(0, 2200));
+	ok("the switch explains itself", early.includes("可以立即安装"), early.slice(0, 2200));
+	const button = findButton(view.output, "立即更新");
+	ok("a held row offers install now", !!button, button);
+	if (button) {
+		await button.props.onClick();
+		await sleep(120);
+		ok(
+			"the overlay is asked to skip the hold",
+			JSON.stringify(env.api.overlays) === '[{"name":"dshmarket","version":"1.73.20","force":true}]',
+			JSON.stringify(env.api.overlays)
+		);
+		const after = JSON.stringify(view.output);
+		ok("the installed row leaves the held card", !after.includes("dsh-ocu-card-held"), after.slice(0, 1800));
+		ok("the skip ends with a restart", after.includes("立即重启 DSH"), after.slice(0, 1800));
+		ok("the restart reminder is stored", env.localStorage.getItem("dsh-one-click-update:restart-pending") !== null, env.localStorage.getItem("dsh-one-click-update:restart-pending"));
+	}
+	view.unmount();
+}
+
+/* ------------------------------------------------------------------ */
+/* Scenario 21 — switch on, but the Host has no pnpm to install with    */
+/* ------------------------------------------------------------------ */
+{
+	const env = await load({
+		appPhase: "idle",
+		packages: [],
+		overlayForce: false,
+		holdNames: ["dshmarket"],
+		storage: { "dsh-one-click-update:skip-hold": "1" },
+		updatesDetail: {
+			dshmarket: {
+				updateAvailable: false,
+				current: "1.73.19",
+				latest: "1.73.20",
+				heldUpdate: { latest: "1.73.20" }
+			}
+		}
+	});
+	await sleep(80);
+	const page = env.registered.find((r) => r.options.name === "main");
+	const view = env.React.mount(page.component, { t: env.t });
+	await sleep(200);
+	const button = findButton(view.output, "立即更新");
+	ok("the switch works on an older Host", !!button, button);
+	if (button) {
+		await button.props.onClick();
+		await sleep(1900);
+		ok("the market is asked with force", JSON.stringify(env.api.posted) === '["dshmarket"]', JSON.stringify(env.api.posted));
+		ok("no overlay without host support", env.api.overlays.length === 0, JSON.stringify(env.api.overlays));
+		const after = JSON.stringify(view.output);
+		ok("a Host without pnpm is named as such", after.includes("没有可用的 pnpm 上下文"), after.slice(0, 2200));
+		ok("the manual install command is complete", after.includes("pnpm add dshmarket@1.73.20 --save-exact --config.minimum-release-age=0"), after.slice(0, 2400));
+		ok("the stale Host half is not blamed", !after.includes("Host 半部"), after.slice(0, 2200));
+		ok("the row stays for a retry", after.includes("dsh-ocu-card-held") && after.includes("1.73.20"), after.slice(0, 2200));
+	}
+	view.unmount();
+}
+
+/* ------------------------------------------------------------------ */
+/* Scenario 21b — switch on, but the loaded Host half predates it       */
+/* ------------------------------------------------------------------ */
+{
+	const env = await load({
+		appPhase: "idle",
+		packages: [],
+		overlayLegacy: true,
+		holdNames: ["dshmarket"],
+		storage: { "dsh-one-click-update:skip-hold": "1" },
+		updatesDetail: {
+			dshmarket: {
+				updateAvailable: false,
+				current: "1.73.19",
+				latest: "1.73.20",
+				heldUpdate: { latest: "1.73.20" }
+			}
+		}
+	});
+	await sleep(80);
+	const page = env.registered.find((r) => r.options.name === "main");
+	const view = env.React.mount(page.component, { t: env.t });
+	await sleep(200);
+	const button = findButton(view.output, "立即更新");
+	ok("the switch also works against an older Host", !!button, button);
+	if (button) {
+		await button.props.onClick();
+		await sleep(1900);
+		const after = JSON.stringify(view.output);
+		ok("an older Host half is named", after.includes("Host 半部"), after.slice(0, 2200));
+		ok("no manual command is offered for a stale Host", !after.includes("pnpm add dshmarket"), after.slice(0, 2400));
+		ok("the older Host row stays for a retry", after.includes("dsh-ocu-card-held"), after.slice(0, 2200));
+	}
+	view.unmount();
+}
+
+/* ------------------------------------------------------------------ */
+/* Scenario 22 — a run that parked a package as "waiting" gets settled  */
+/* ------------------------------------------------------------------ */
+{
+	const env = await load({
+		appPhase: "idle",
+		packages: [{ name: "gamma", source: "npm", installedVersion: "3.0.0", latestVersion: "3.1.0" }],
+		holdNames: ["gamma"],
+		overlayForce: true,
+		storage: { "dsh-one-click-update:skip-hold": "1" }
+	});
+	await sleep(80);
+	const page = env.registered.find((r) => r.options.name === "main");
+	const view = env.React.mount(page.component, { t: env.t });
+	await sleep(2600);
+	const parked = JSON.stringify(view.output);
+	ok("a held run parks the row in the held card", parked.includes("1 个等待成熟期") && parked.includes("dsh-ocu-card-held"), parked.slice(0, 1600));
+	const button = findButton(view.output, "立即更新");
+	ok("the parked row can be installed now", !!button, button);
+	if (button) {
+		await button.props.onClick();
+		await sleep(150);
+		ok(
+			"the parked row is installed with the override",
+			JSON.stringify(env.api.overlays) === '[{"name":"gamma","version":"3.1.0","force":true}]',
+			JSON.stringify(env.api.overlays)
+		);
+		const after = JSON.stringify(view.output);
+		ok("the settled row leaves the held card", !after.includes("dsh-ocu-card-held"), after.slice(0, 1800));
+		ok("the settled row reads as installed", after.includes("3.1.0"), after.slice(0, 1800));
+	}
+	view.unmount();
+}
+
+/* ------------------------------------------------------------------ */
+/* Scenario 23 — the override is passed and pnpm still refuses         */
+/* ------------------------------------------------------------------ */
+{
+	const env = await load({
+		appPhase: "idle",
+		packages: [],
+		overlayForce: true,
+		overlayHold: true,
+		holdNames: ["dshmarket"],
+		storage: { "dsh-one-click-update:skip-hold": "1" },
+		updatesDetail: {
+			dshmarket: {
+				updateAvailable: false,
+				current: "1.73.19",
+				latest: "1.73.20",
+				heldUpdate: { latest: "1.73.20" }
+			}
+		}
+	});
+	await sleep(80);
+	const page = env.registered.find((r) => r.options.name === "main");
+	const view = env.React.mount(page.component, { t: env.t });
+	await sleep(200);
+	const button = findButton(view.output, "立即更新");
+	ok("the override path is offered", !!button, button);
+	if (button) {
+		await button.props.onClick();
+		await sleep(300);
+		const after = JSON.stringify(view.output);
+		ok(
+			"the override reaches pnpm once",
+			JSON.stringify(env.api.overlays) === '[{"name":"dshmarket","version":"1.73.20","force":true}]',
+			JSON.stringify(env.api.overlays)
+		);
+		ok("a refusal after the override is not a wait", after.includes("pnpm 仍拒绝安装"), after.slice(0, 2400));
+		ok("the refused row stays for a retry", after.includes("dsh-ocu-card-held"), after.slice(0, 2200));
+	}
+	view.unmount();
+}
+
+/* ------------------------------------------------------------------ */
+/* Scenario 24 — the restart stays reachable with nothing pending      */
+/* ------------------------------------------------------------------ */
+{
+	const env = await load({ packages: [] });
+	await sleep(120);
+	const page = env.registered.find((r) => r.options.name === "main");
+	const view = env.React.mount(page.component, { t: env.t });
+	const text = JSON.stringify(view.output);
+	ok("restart is offered with nothing pending", text.includes("立即重启 DSH"), text.slice(0, 1400));
+	const button = findButton(view.output, "立即重启 DSH");
+	ok("idle restart is the quiet variant", button !== undefined && String(button.props.className).includes("dsh-ocu-primary-quiet"), button && button.props.className);
+	ok("idle restart does not warn", button !== undefined && !String(button.props.className).includes("warn"), button && button.props.className);
+	ok("idle restart explains itself", button !== undefined && String(button.props.title).includes("随时可以重启"), button && button.props.title);
+	if (button !== undefined) {
+		await button.props.onClick();
+		await sleep(60);
+		const after = JSON.stringify(view.output);
+		ok("idle restart reaches the host route", env.api.restarts.length === 1, JSON.stringify(env.api.restarts));
+		ok("idle restart shows progress", after.includes("正在重启 DSH"), after.slice(0, 1400));
+	}
+	view.unmount();
+}
+
+/* ------------------------------------------------------------------ */
+/* Scenario — a failed install handoff retries once, by itself         */
+/* ------------------------------------------------------------------ */
+{
+	const env = await load({ appPhase: "available", packages: [] });
+	await sleep(140);
+	const page = env.registered.find((r) => r.options.name === "main");
+	const before = bridgeCalls.open;
+	const view = env.React.mount(page.component, { t: env.t });
+	await sleep(160);
+	ok("install retry: the app flow opened once", bridgeCalls.open === before + 1, bridgeCalls.open);
+	const listeners = bridgeCalls.listeners;
+	listeners[listeners.length - 1].call(void 0, { phase: "error", failure: "install", version: "9.9.9" });
+	await sleep(80);
+	const retrying = JSON.stringify(view.output);
+	ok("install retry: the retry is announced", retrying.includes("正在自动重试"), retrying.slice(0, 1200));
+	ok("install retry: the retry button is busy", retrying.includes('"data-busy":"true"'), retrying.slice(0, 1600));
+	await sleep(5400);
+	ok("install retry: the install is opened again", bridgeCalls.open === before + 2, bridgeCalls.open);
+	await sleep(300);
+	ok("install retry: only one automatic retry", bridgeCalls.open === before + 2, bridgeCalls.open);
+	view.unmount();
+}
+
+/* ------------------------------------------------------------------ */
+/* Scenario — a Host still busy after the plugin run delays the open   */
+/* ------------------------------------------------------------------ */
+{
+	const env = await load({ appPhase: "available", packages: [], probeSkip: 1, probeBusy: 1 });
+	const before = bridgeCalls.open;
+	const page = env.registered.find((r) => r.options.name === "main");
+	const view = env.React.mount(page.component, { t: env.t });
+	await sleep(900);
+	ok("busy host: the open waits for the probe", bridgeCalls.open === before, bridgeCalls.open);
+	ok("busy host: the first probe failed", env.api.probeFailures === 1, env.api.probeFailures);
+	await sleep(2600);
+	ok("busy host: the open follows a settled Host", bridgeCalls.open === before + 1, bridgeCalls.open);
+	ok("busy host: the probe answered in the end", env.api.probeFailures === 1, env.api.probeFailures);
 	view.unmount();
 }
 

@@ -36,9 +36,25 @@ window.__ModuleLoader__.load({
 		const RESTART_API = "/dsh-one-click-update/restart";
 		/** Host route of this bundle: installs over a mounted bundle (see index.js). */
 		const OVERLAY_API = "/dsh-one-click-update/overlay";
+		/** Where the "skip the maturity hold" switch is remembered. */
+		const SKIP_HOLD_STAMP = "dsh-one-click-update:skip-hold";
 
 		/** App phases during which a second run must not start. */
 		const BUSY_PHASES = { downloading: true, verifying: true, installing: true };
+
+		/**
+		 * The Desktop shell gives its Host one 10 s budget to answer a task
+		 * inspection (`desktop update: task inspection timed out`) and never
+		 * retries. The plugin run that runs right before the app flow leaves the
+		 * Host busy — hot-reloading the packages pnpm just replaced — so the
+		 * automatic app open probes the Host first and waits for an answer instead
+		 * of spending that single budget on a busy Host.
+		 */
+		const HOST_PROBE_TIMEOUT_MS = 3000;
+		const HOST_PROBE_ROUNDS = 5;
+		const HOST_PROBE_SPACING_MS = 2000;
+		/** One automatic retry of a failed install handoff (the shell reports it as "install"). */
+		const INSTALL_RETRY_DELAY_MS = 5000;
 
 		/** Market operation states that end a run. */
 		const TERMINAL_STATES = { succeeded: true, failed: true, cancelled: true, "rolled-back": true };
@@ -98,11 +114,21 @@ window.__ModuleLoader__.load({
 				"held.untilEstimated": "预计 {when} 前后可更新",
 				"held.untilUnknown": "发布满期限后可更新",
 				"held.note": "成熟期内的插件不参与本次更新；到期后重新检查即可更新。",
+				"held.skip": "跳过冷静期",
+				"held.skipHint": "已开启：下面这些刚发布、仍在冷静期内的版本可以立即安装。它们还没经过等待期，出问题请在市场里回滚；此开关只影响下面这些插件，不改动 profile 的发布策略。",
+				"held.force": "立即更新",
+				"held.forceAll": "全部立即更新",
+				"held.forcing": "正在立即安装…",
+				"held.forceFailed": "立即更新失败：{reason}",
+				"held.forceStale": "当前运行的 Host 半部还不支持跳过冷静期：请先更新本插件再重启 DSH，然后重试。",
+				"held.forceManual": "当前运行的 Host 没有可用的 pnpm 上下文，无法代为安装。请在 profile 目录手动执行 pnpm add {target} --save-exact --config.minimum-release-age=0，装好后重启 DSH。",
+				"held.forceRefused": "已经带上跳过冷静期的参数，pnpm 仍拒绝安装：{reason}",
 				"plugins.restartNow": "立即重启 DSH",
 				"plugins.restarting": "正在重启 DSH…",
 				"plugins.restartFailed": "重启失败：{reason}",
 				"plugins.restartManual": "未能自动重启，请手动重启 DSH。",
 				"plugins.restartStale": "重启接口尚未加载：请先手动退出并重新打开 DSH 桌面 App 一次，之后就能一键重启。",
+				"plugins.restartIdle": "随时可以重启 DSH（会中断当前页面，重启后重新打开本面板）。",
 				"plugins.refreshHint": "插件已更新，刷新页面后即可新建会话。",
 				"plugins.refreshNow": "刷新页面",
 				"plugins.refreshing": "正在刷新页面…",
@@ -111,6 +137,7 @@ window.__ModuleLoader__.load({
 				"app.action": "检查并更新",
 				"app.retry": "重试",
 				"app.busy": "检查中…",
+				"app.retrying": "安装没能开始，正在自动重试…",
 				"app.hint": "更新 App 的最后一步由桌面端弹出「安装并重启」确认框。",
 
 				"phase.loading": "正在读取更新状态…",
@@ -187,11 +214,21 @@ window.__ModuleLoader__.load({
 				"held.untilEstimated": "Estimated around {when}",
 				"held.untilUnknown": "Available once the release matures",
 				"held.note": "Plugins in the maturity hold are not part of this update; check again once the hold clears.",
+				"held.skip": "Skip the cooling-off period",
+				"held.skipHint": "On: these fresh releases install right away instead of waiting out the maturity hold. They have not been in the wild long — roll back in the market if something breaks. The switch only affects the plugins below; the profile's release policy is untouched.",
+				"held.force": "Install now",
+				"held.forceAll": "Install all now",
+				"held.forcing": "Installing now…",
+				"held.forceFailed": "Install now failed: {reason}",
+				"held.forceStale": "The running Host half cannot skip the hold yet: update this plugin, restart DSH, then try again.",
+				"held.forceManual": "The running Host has no pnpm to install with. Run pnpm add {target} --save-exact --config.minimum-release-age=0 in the profile directory, then restart DSH.",
+				"held.forceRefused": "The release-age override was passed, but pnpm still refused: {reason}",
 				"plugins.restartNow": "Restart DSH now",
 				"plugins.restarting": "Restarting DSH…",
 				"plugins.restartFailed": "Restart failed: {reason}",
 				"plugins.restartManual": "Could not restart automatically. Please restart DSH manually.",
 				"plugins.restartStale": "The restart endpoint is not loaded yet: quit and reopen the DSH desktop app once, and one-click restart will work from then on.",
+				"plugins.restartIdle": "Restart DSH whenever you like (this page closes and you reopen the panel after boot).",
 				"plugins.refreshHint": "Plugins updated. Refresh this page before opening a new session.",
 				"plugins.refreshNow": "Refresh page",
 				"plugins.refreshing": "Refreshing…",
@@ -200,6 +237,7 @@ window.__ModuleLoader__.load({
 				"app.action": "Check and update",
 				"app.retry": "Retry",
 				"app.busy": "Checking…",
+				"app.retrying": "Install did not start, retrying automatically…",
 				"app.hint": "The desktop app still asks for confirmation before installing and restarting.",
 
 				"phase.loading": "Reading update state…",
@@ -309,7 +347,9 @@ window.__ModuleLoader__.load({
 				version: void 0,
 				percent: void 0,
 				failure: void 0,
-				pending: false
+				pending: false,
+				/** The install handoff failed once and the auto retry is scheduled. */
+				retrying: false
 			},
 			market: {
 				/** unknown | checking | ready | unsupported | error */
@@ -320,6 +360,12 @@ window.__ModuleLoader__.load({
 				packages: [],
 				/** Installed plugins whose newer release is still inside the maturity hold. */
 				held: [],
+				/** The held card's "install held releases now" switch. */
+				skipHold: false,
+				/** The held plugin an over-age install is running for right now. */
+				forcing: void 0,
+				/** Per held plugin: {status:"failed", error} — a success leaves the card. */
+				forced: {},
 				error: void 0,
 				running: false,
 				finished: false,
@@ -349,6 +395,8 @@ window.__ModuleLoader__.load({
 		let panelOpen = false;
 		/** One automatic app open per session, attempted only after the plugin run finished. */
 		let autoAppRequested = false;
+		/** One automatic retry per session when the shell's install handoff failed. */
+		let installRetryScheduled = false;
 
 		function emit() {
 			for (const listener of [...listeners]) listener();
@@ -367,6 +415,8 @@ window.__ModuleLoader__.load({
 
 		function applyPresentation(raw) {
 			patchApp(normalize(raw));
+			/* A failed install handoff only ever arrives as a pushed state. */
+			maybeRetryInstall();
 		}
 
 		/** Subscribe once to the shell's presentation stream; it never replays. */
@@ -441,7 +491,73 @@ window.__ModuleLoader__.load({
 			Promise.resolve()
 				.then(() => updates.open())
 				.catch(() => {})
-				.then(() => patchApp({ pending: false }));
+				.then(() => {
+					patchApp({ pending: false, retrying: false });
+					maybeRetryInstall();
+				});
+		}
+
+		/** Ask the Host anything cheap; never throws. */
+		async function probeHost() {
+			const controller = typeof AbortController === "function" ? new AbortController() : void 0;
+			const timer = controller === void 0 ? void 0 : setTimeout(() => controller.abort(), HOST_PROBE_TIMEOUT_MS);
+			try {
+				const response = await fetch(API + "/capabilities", {
+					credentials: "same-origin",
+					cache: "no-store",
+					headers: { accept: "application/json" },
+					signal: controller === void 0 ? void 0 : controller.signal
+				});
+				/* Any status at all proves the Host answered; the market may still be
+				   remounting behind a 404, which is exactly what this wait is for. */
+				return typeof response.status === "number";
+			} catch (error) {
+				/* A blocked Host also holds this probe: that is the signal we wait for. */
+				return false;
+			} finally {
+				if (timer !== void 0) clearTimeout(timer);
+			}
+		}
+
+		/**
+		 * Let the Host finish the plugin run before the shell asks it to inspect
+		 * tasks. `inspect` itself is instant; it only ends in the shell's timeout
+		 * when the Host cannot answer at all, so an answered probe is the real
+		 * "ready for the install handoff" signal. Never blocks longer than the
+		 * probe rounds: a half-broken Host still gets its chance.
+		 */
+		async function waitForHostSettle() {
+			for (let round = 0; round < HOST_PROBE_ROUNDS; round += 1) {
+				if (await probeHost()) return;
+				await sleep(HOST_PROBE_SPACING_MS);
+			}
+		}
+
+		/** Open the app flow once the Host settled; skip it if the page was left. */
+		async function openAppUpdateWhenSettled() {
+			await waitForHostSettle();
+			if (!panelOpen) return;
+			requestAppUpdate();
+		}
+
+		/**
+		 * The shell's install handoff gets one 10 s inspection and no retry of its
+		 * own; every such failure reaches the page as the unclassified "install"
+		 * kind (its real message never leaves the native dialog). The package is
+		 * already downloaded at this point, so one quiet retry usually installs
+		 * it; if it fails again the card simply keeps the failure.
+		 */
+		function maybeRetryInstall() {
+			if (installRetryScheduled) return;
+			if (state.app.phase !== "error" || state.app.failure !== "install") return;
+			if (!panelOpen) return;
+			installRetryScheduled = true;
+			patchApp({ retrying: true });
+			setTimeout(() => {
+				patchApp({ retrying: false });
+				if (!panelOpen) return;
+				requestAppUpdate();
+			}, INSTALL_RETRY_DELAY_MS);
 		}
 
 		/**
@@ -455,7 +571,7 @@ window.__ModuleLoader__.load({
 			if (!state.market.finished) return;
 			if (!state.app.supported || state.app.phase !== "available") return;
 			autoAppRequested = true;
-			requestAppUpdate();
+			void openAppUpdateWhenSettled();
 		}
 
 		/* ---------------------------------------------------------------- */
@@ -533,7 +649,7 @@ window.__ModuleLoader__.load({
 		/** Ask the market which installed plugins can be updated. */
 		async function checkPlugins(force) {
 			if (state.market.running) return;
-			patchMarket({ status: "checking", error: void 0 });
+			patchMarket({ status: "checking", error: void 0, forced: {}, forcing: void 0 });
 			const res = await apiGet(API + "/updates/summary" + (force ? "?force=1" : ""));
 			if (res.status === 404) {
 				patchMarket({ status: "unsupported", checked: 0, updatable: 0, packages: [], held: [] });
@@ -680,11 +796,15 @@ window.__ModuleLoader__.load({
 			return typeof message === "string" && IN_USE_TEXT.test(message);
 		}
 
-		/** Install the target version over the running one through the Host half. */
-		async function overlayUpdate(pkg) {
+		/**
+		 * Install one exact version over the running one through the Host half.
+		 * `force` asks the Host to lift the profile's release-age wait for this one
+		 * pnpm call (see index.js); without it pnpm keeps its usual 24h hold.
+		 */
+		async function overlayInstall(name, version, force) {
 			let res;
 			try {
-				res = await apiPost(OVERLAY_API, { name: pkg.name, version: pkg.latestVersion });
+				res = await apiPost(OVERLAY_API, force === true ? { name, version, force: true } : { name, version });
 			} catch (error) {
 				return {
 					status: "blocked",
@@ -697,7 +817,8 @@ window.__ModuleLoader__.load({
 				return {
 					status: "done",
 					overlaid: true,
-					installedVersion: typeof body.version === "string" ? body.version : pkg.latestVersion,
+					forced: body.forced === true || force === true,
+					installedVersion: typeof body.version === "string" ? body.version : version,
 					restartRequired: true,
 					refreshRequired: false
 				};
@@ -717,6 +838,11 @@ window.__ModuleLoader__.load({
 			};
 		}
 
+		/** Install the target version over the running one through the Host half. */
+		function overlayUpdate(pkg) {
+			return overlayInstall(pkg.name, pkg.latestVersion, false);
+		}
+
 		/**
 		 * A market update that failed because the plugin is mounted falls back to
 		 * the overlay install. Anything else keeps its own outcome.
@@ -729,6 +855,148 @@ window.__ModuleLoader__.load({
 			} finally {
 				patchMarket({ overlay: void 0 });
 			}
+		}
+
+		/* ---------------------------------------------------------------- */
+		/* The maturity-hold switch                                           */
+		/* ---------------------------------------------------------------- */
+
+		/**
+		 * Whether the running Host can lift the release-age wait for one install.
+		 * It is a property of the loaded Host bundle, which only a restart changes,
+		 * so the answer is asked once and kept.
+		 */
+		let overlayForce;
+		async function overlayForceSupport() {
+			if (overlayForce !== void 0) return overlayForce;
+			let res;
+			try {
+				res = await apiGet(OVERLAY_API);
+			} catch (error) {
+				res = { status: 0, body: void 0 };
+			}
+			const body = res.body !== null && typeof res.body === "object" ? res.body : {};
+			// `known` separates the two refusals: a Host without the field is an old
+			// bundle (the page was never reloaded after the update), a Host that
+			// answers `force: false` simply has no pnpm to run.
+			overlayForce = {
+				known: typeof body.force === "boolean",
+				requested: body.force === true,
+				overlay: body.overlay === true,
+				reason: typeof body.reason === "string" ? body.reason : void 0,
+				profile: typeof body.profile === "string" ? body.profile : void 0
+			};
+			return overlayForce;
+		}
+
+		/**
+		 * The market's own escape hatch (`force: true`). It lifts the wait on hosts
+		 * that run pnpm themselves; on the desktop the market's maturity gate
+		 * refuses a held target before pnpm is started at all, which is why the
+		 * overlay path above exists.
+		 */
+		async function marketForceUpdate(name, version) {
+			let res;
+			try {
+				res = await apiPost(API + "/updates", { packageName: name, force: true });
+			} catch (error) {
+				return { status: "failed", error: error instanceof Error ? error.message : String(error) };
+			}
+			if (res.status !== 202 || res.body === null || typeof res.body !== "object" || res.body.operation === void 0) {
+				return outcomeOf(res);
+			}
+			let outcome = await pollOperation(res.body.operation.operationId, name);
+			if (outcome.status === "lost") {
+				const installed = await landed({ name }, version);
+				if (installed !== void 0) return installed;
+				outcome = { status: "failed", code: "OPERATION_LOST", error: outcome.error };
+			}
+			return outcome;
+		}
+
+		/** Install one held release now, through whichever door this Host has. */
+		async function forceHeldOne(row) {
+			const version = row.heldVersion;
+			const support = await overlayForceSupport();
+			if (support.requested) {
+				const outcome = await overlayInstall(row.name, version, true);
+				if (outcome.status === "blocked" && outcome.code === "overlay-unavailable") return await marketForceUpdate(row.name, version);
+				// The override was passed and pnpm still held the release: that is a
+				// refusal, not a wait, so the row keeps a real reason.
+				if (outcome.status === "pending") {
+					return { status: "failed", code: "RELEASE_TOO_FRESH", error: outcome.error, refused: true };
+				}
+				return outcome;
+			}
+			const outcome = await marketForceUpdate(row.name, version);
+			if (outcome.status === "pending") {
+				// The market refuses a held target and this Host cannot lift the wait
+				// on its own. Say which side is missing instead of presenting the
+				// refusal as "wait and it will pass".
+				return {
+					...outcome,
+					code: "RELEASE_AGE_HELD",
+					hostStale: support.known !== true,
+					overlayReason: support.reason,
+					profile: support.profile
+				};
+			}
+			return outcome;
+		}
+
+		/**
+		 * Install held releases now (`onlyName` narrows it to one row). One at a
+		 * time: the profile has a single pnpm lock, and the Host half refuses a
+		 * concurrent overlay anyway.
+		 */
+		async function runForcedHeld(onlyName) {
+			if (state.market.forcing !== void 0) return;
+			const rows = heldRowsOf(state.market).filter((row) => onlyName === void 0 || row.name === onlyName);
+			if (rows.length === 0) return;
+			const forced = { ...state.market.forced };
+			const held = [...state.market.held];
+			let restartRequired = state.market.restartRequired === true;
+			for (const row of rows) {
+				delete forced[row.name];
+				patchMarket({ forcing: row.name, forced: { ...forced } });
+				let outcome;
+				try {
+					outcome = await forceHeldOne(row);
+				} catch (error) {
+					outcome = { status: "failed", error: error instanceof Error ? error.message : String(error) };
+				}
+				if (outcome.status === "done") {
+					restartRequired = true;
+					const at = held.findIndex((entry) => entry.name === row.name);
+					if (at !== -1) held.splice(at, 1);
+					delete forced[row.name];
+					// A finished run may have parked this package as "waiting"; the
+					// forced install settled it, so the row moves to the done state
+					// instead of lingering in the held card.
+					const previous = state.market.results[row.name];
+					if (previous !== void 0 && previous.status === "pending") {
+						patchMarket({
+							results: {
+								...state.market.results,
+								[row.name]: { status: "done", installedVersion: row.heldVersion, overlaid: true, forced: true }
+							}
+						});
+					}
+				} else {
+					forced[row.name] = {
+						status: "failed",
+						error: outcome.error,
+						code: outcome.code,
+						hostStale: outcome.hostStale === true,
+						manual: outcome.hostStale !== true && outcome.code === "RELEASE_AGE_HELD",
+						refused: outcome.refused === true,
+						target: `${row.name}@${row.heldVersion}`
+					};
+				}
+				patchMarket({ held: [...held], forced: { ...forced } });
+			}
+			patchMarket({ forcing: void 0, restartRequired });
+			if (restartRequired) rememberRestart(true);
 		}
 
 		/** Poll one market operation until it reaches a terminal state. */
@@ -971,6 +1239,29 @@ window.__ModuleLoader__.load({
 			}
 		}
 
+		/** The held card's switch, remembered across page loads. */
+		function readSkipHold() {
+			const storage = localStore();
+			if (storage === void 0 || storage === null) return false;
+			try {
+				return storage.getItem(SKIP_HOLD_STAMP) === "1";
+			} catch (error) {
+				return false;
+			}
+		}
+
+		function writeSkipHold(on) {
+			const storage = localStore();
+			if (storage !== void 0 && storage !== null) {
+				try {
+					storage.setItem(SKIP_HOLD_STAMP, on ? "1" : "0");
+				} catch (error) {
+					/* the switch still applies to this page */
+				}
+			}
+			patchMarket({ skipHold: on });
+		}
+
 		function rememberRestart(pending) {
 			const storage = localStore();
 			if (storage === void 0 || storage === null) return;
@@ -1106,6 +1397,7 @@ window.__ModuleLoader__.load({
 			if (!app.supported) return t("app.unsupported");
 			if (!app.ready) return t("phase.loading");
 			if (app.pending) return t("app.busy");
+			if (app.retrying === true) return t("app.retrying");
 			switch (app.phase) {
 				case "checking":
 				case "check":
@@ -1448,37 +1740,78 @@ window.__ModuleLoader__.load({
 
 		/**
 		 * The hold category: packages whose newer release exists but is still inside
-		 * the market's maturity hold. They are never part of a run; the rows only
-		 * say what is waiting and when it should clear.
+		 * the market's maturity hold. A run never touches them; with the card's
+		 * switch on, each row can install its fresh release anyway (the Host half
+		 * lifts pnpm's release-age wait for that one call).
 		 */
 		function HeldRows(props) {
 			const rows = props.rows;
 			const t = props.t;
+			const skip = props.skip === true;
+			const forcing = props.forcing;
+			const forced = props.forced === void 0 ? {} : props.forced;
+			const onForce = props.onForce;
+			const disabled = props.disabled === true;
 			if (rows.length === 0) return null;
 			return h(
 				"ul",
 				{ className: "dsh-ocu-rows dsh-ocu-rows-held" },
-				rows.map((row) => h(
-					"li",
-					{ className: "dsh-ocu-row dsh-ocu-row-held", "data-tone": "pending", key: row.name },
-					h(
-						"span",
-						{ className: "dsh-ocu-row-main" },
-						h("code", { className: "dsh-ocu-row-name" }, row.name),
+				rows.map((row) => {
+					const failure = forced[row.name];
+					const busy = forcing === row.name;
+					const tone = failure === void 0 ? "pending" : "error";
+					let stateText = holdUntilText(row, t);
+					let stateTitle = t("plugins.pendingHold");
+					if (busy) {
+						stateText = t("held.forcing");
+						stateTitle = t("held.forcing");
+					} else if (failure !== void 0) {
+						const reason = failure.hostStale === true
+							? t("held.forceStale")
+							: failure.manual === true
+								? t("held.forceManual", { target: failure.target === void 0 ? row.name : failure.target })
+								: failure.error === void 0 ? "?" : failure.error;
+						stateText = failure.refused === true
+							? t("held.forceRefused", { reason })
+							: t("held.forceFailed", { reason });
+						stateTitle = stateText;
+					}
+					return h(
+						"li",
+						{ className: "dsh-ocu-row dsh-ocu-row-held", "data-tone": tone, key: row.name },
 						h(
 							"span",
-							{ className: "dsh-ocu-row-versions" },
-							h("span", { className: "dsh-ocu-version" }, row.installedVersion === void 0 ? "?" : row.installedVersion),
-							h("span", { className: "dsh-ocu-arrow", "aria-hidden": "true" }, "\u2192"),
-							h("span", { className: "dsh-ocu-version dsh-ocu-version-new" }, row.heldVersion)
-						)
-					),
-					h(
-						"span",
-						{ className: "dsh-ocu-row-state", title: t("plugins.pendingHold") },
-						h("span", null, holdUntilText(row, t))
-					)
-				))
+							{ className: "dsh-ocu-row-main" },
+							h("code", { className: "dsh-ocu-row-name" }, row.name),
+							h(
+								"span",
+								{ className: "dsh-ocu-row-versions" },
+								h("span", { className: "dsh-ocu-version" }, row.installedVersion === void 0 ? "?" : row.installedVersion),
+								h("span", { className: "dsh-ocu-arrow", "aria-hidden": "true" }, "\u2192"),
+								h("span", { className: "dsh-ocu-version dsh-ocu-version-new" }, row.heldVersion)
+							)
+						),
+						h(
+							"span",
+							{ className: "dsh-ocu-row-state", title: stateTitle },
+							busy ? Spinner() : null,
+							h("span", null, stateText)
+						),
+						skip && !busy
+							? h(
+								"button",
+								{
+									type: "button",
+									className: "dsh-ocu-row-action",
+									onClick: () => void onForce(row),
+									"aria-disabled": disabled ? "true" : void 0,
+									disabled
+								},
+								t("held.force")
+							)
+							: null
+					);
+				})
 			);
 		}
 
@@ -1505,6 +1838,8 @@ window.__ModuleLoader__.load({
 			const t = props.t;
 			const rows = heldRowsOf(market);
 			if (rows.length === 0) return null;
+			const skip = market.skipHold === true;
+			const busy = market.forcing !== void 0 || market.running === true;
 			return h(
 				"section",
 				{ className: "dsh-ocu-card dsh-ocu-card-held", "data-tone": "held" },
@@ -1512,10 +1847,53 @@ window.__ModuleLoader__.load({
 					"div",
 					{ className: "dsh-ocu-card-head" },
 					h("h2", { className: "dsh-ocu-card-title" }, t("section.held")),
+					h(
+						"label",
+						{ className: "dsh-ocu-switch", title: t("held.skipHint") },
+						h("input", {
+							type: "checkbox",
+							className: "dsh-ocu-switch-input",
+							checked: skip,
+							disabled: busy,
+							onChange: (event) => writeSkipHold(event.target.checked === true)
+						}),
+						h("span", { className: "dsh-ocu-switch-track", "aria-hidden": "true" }),
+						h("span", { className: "dsh-ocu-switch-label" }, t("held.skip"))
+					),
 					h("span", { className: "dsh-ocu-card-meta" }, t("held.meta", { count: rows.length }))
 				),
-				h(HeldRows, { rows, t }),
-				h("p", { className: "dsh-ocu-card-foot" }, t("held.note"))
+				h(HeldRows, {
+					rows,
+					t,
+					skip,
+					forcing: market.forcing,
+					forced: market.forced,
+					onForce: (row) => void runForcedHeld(row.name),
+					disabled: busy
+				}),
+				h(
+					"p",
+					{ className: skip ? "dsh-ocu-card-note dsh-ocu-note-warn" : "dsh-ocu-card-foot" },
+					skip ? t("held.skipHint") : t("held.note")
+				),
+				skip && rows.length > 1
+					? h(
+						"div",
+						{ className: "dsh-ocu-card-actions" },
+						h(
+							"button",
+							{
+								type: "button",
+								className: "dsh-ocu-primary",
+								onClick: () => void runForcedHeld(void 0),
+								"data-busy": busy ? "true" : void 0,
+								"aria-disabled": busy ? "true" : void 0,
+								disabled: busy
+							},
+							busy ? t("held.forcing") : t("held.forceAll")
+						)
+					)
+					: null
 			);
 		}
 
@@ -1572,6 +1950,7 @@ window.__ModuleLoader__.load({
 			// An old Host has no overlay route; restarting DSH loads it from disk,
 			// so offer the very restart that makes the next run work.
 			const overlayBlocked = blockedResults.some((result) => result.code === "overlay-unavailable");
+			const restartOffered = restartNeeded || overlayBlocked;
 			if (blockedResults.length > 0) {
 				notes.push(overlayBlocked ? t("plugins.overlayUnavailable") : t("plugins.blockedNote"));
 			}
@@ -1625,20 +2004,22 @@ window.__ModuleLoader__.load({
 						},
 						actionLabel
 					),
-					restartNeeded || overlayBlocked
-						? h(
-							"button",
-							{
-								type: "button",
-								className: "dsh-ocu-primary dsh-ocu-primary-warn",
-								onClick: () => void restartDsh(),
-								"data-busy": restarting ? "true" : void 0,
-								"aria-disabled": restarting ? "true" : void 0,
-								disabled: restarting
-							},
-							restarting ? t("plugins.restarting") : t("plugins.restartNow")
-						)
-						: null,
+					// Always offered: a restart is the fix for a stale Host, and the
+					// page cannot always tell that it is stale. Warn only when the
+					// restart is the thing standing between the user and the update.
+					h(
+						"button",
+						{
+							type: "button",
+							className: restartOffered ? "dsh-ocu-primary dsh-ocu-primary-warn" : "dsh-ocu-primary dsh-ocu-primary-quiet",
+							title: restartOffered ? void 0 : t("plugins.restartIdle"),
+							onClick: () => void restartDsh(),
+							"data-busy": restarting ? "true" : void 0,
+							"aria-disabled": restarting ? "true" : void 0,
+							disabled: restarting
+						},
+						restarting ? t("plugins.restarting") : t("plugins.restartNow")
+					),
 					refreshNeeded
 						? h(
 							"button",
@@ -1659,7 +2040,7 @@ window.__ModuleLoader__.load({
 		function AppSection(props) {
 			const app = props.app;
 			const t = props.t;
-			const busy = app.pending || BUSY_PHASES[app.phase] === true;
+			const busy = app.pending || app.retrying === true || BUSY_PHASES[app.phase] === true;
 			const showBar = app.phase === "downloading" || app.phase === "verifying";
 			const showFailure = app.phase === "error" && app.failure !== void 0;
 			const label = busy ? t("app.busy") : app.phase === "error" ? t("app.retry") : t("app.action");
@@ -1682,6 +2063,7 @@ window.__ModuleLoader__.load({
 				),
 				showBar ? ProgressBar({ percent: app.percent === void 0 ? 0 : app.percent }) : null,
 				showFailure ? h("p", { className: "dsh-ocu-card-note" }, failureText(app, t)) : null,
+				app.retrying === true ? h("p", { className: "dsh-ocu-card-note" }, t("app.retrying")) : null,
 				h(
 					"div",
 					{ className: "dsh-ocu-card-actions" },
@@ -1783,7 +2165,7 @@ window.__ModuleLoader__.load({
 			".dsh-ocu-page-desc{margin:0;font-size:13px;line-height:1.6;color:var(--dsw-alias-label-secondary,#6b6b70)}",
 			".dsh-ocu-card{box-sizing:border-box;max-width:760px;width:100%;margin:0 auto;padding:18px 20px;border:1px solid var(--dsw-alias-border-l2,rgba(0,0,0,.1));border-radius:var(--dsw-radius-md,10px);background:var(--dsw-alias-bg-elevated,#fff);display:flex;flex-direction:column;gap:10px}",
 			'.dsh-ocu-card[data-tone="error"]{border-color:var(--dsw-alias-state-error-primary,#d64545)}',
-			".dsh-ocu-card-head{display:flex;align-items:baseline;justify-content:space-between;gap:12px}",
+			".dsh-ocu-card-head{display:flex;align-items:baseline;justify-content:space-between;flex-wrap:wrap;gap:8px 12px}",
 			".dsh-ocu-card-title{margin:0;font-size:14px;font-weight:600}",
 			".dsh-ocu-card-meta{font-size:12px;color:var(--dsw-alias-label-secondary,#6b6b70)}",
 			".dsh-ocu-card-row{display:flex;align-items:baseline;gap:14px;font-size:13px}",
@@ -1824,6 +2206,19 @@ window.__ModuleLoader__.load({
 			".dsh-ocu-rows-held{margin-top:0}",
 			".dsh-ocu-row-held{font-size:12px}",
 			".dsh-ocu-row-held .dsh-ocu-row-state{white-space:normal;text-align:right;max-width:46%;overflow:visible;text-overflow:clip;line-height:1.45}",
+			'.dsh-ocu-switch{display:inline-flex;align-items:center;gap:6px;cursor:pointer;user-select:none;margin-left:auto;font-size:12px;white-space:nowrap;color:var(--dsw-alias-label-secondary,#6b6b70)}',
+			".dsh-ocu-switch-input{position:absolute;width:1px;height:1px;opacity:0;margin:0;pointer-events:none}",
+			".dsh-ocu-switch-track{position:relative;display:inline-block;width:26px;height:15px;border-radius:999px;background:var(--dsw-alias-interactive-bg-hover,rgba(0,0,0,.16));transition:background .15s ease}",
+			".dsh-ocu-switch-track::after{content:\"\";position:absolute;top:2px;left:2px;width:11px;height:11px;border-radius:50%;background:#fff;box-shadow:0 1px 2px rgba(0,0,0,.25);transition:transform .15s ease}",
+			".dsh-ocu-switch-input:checked+.dsh-ocu-switch-track{background:var(--dsw-alias-state-warning-primary,#b07d1a)}",
+			".dsh-ocu-switch-input:checked+.dsh-ocu-switch-track::after{transform:translateX(11px)}",
+			".dsh-ocu-switch-input:focus-visible+.dsh-ocu-switch-track{outline:2px solid var(--dsw-alias-brand-primary,#3b6ef6);outline-offset:2px}",
+			".dsh-ocu-switch-input:disabled+.dsh-ocu-switch-track{opacity:.55}",
+			".dsh-ocu-row-action{appearance:none;border:none;cursor:pointer;padding:0 10px;height:24px;border-radius:var(--dsw-radius-sm,8px);font-size:12px;white-space:nowrap;color:var(--dsw-alias-button-primary-text,#fff);background:var(--dsw-alias-state-warning-primary,#b07d1a)}",
+			".dsh-ocu-row-action:hover{filter:brightness(1.06)}",
+			".dsh-ocu-row-action:active{filter:brightness(.94)}",
+			".dsh-ocu-row-action:disabled{opacity:.55;cursor:default}",
+			'@media (prefers-reduced-motion:reduce){.dsh-ocu-switch-track,.dsh-ocu-switch-track::after{transition:none}}',
 			"@media (max-width:560px){.dsh-ocu-page{padding:24px 20px 36px}.dsh-ocu-row{flex-direction:column;align-items:flex-start;gap:4px}.dsh-ocu-row-state{max-width:100%}.dsh-ocu-row-held .dsh-ocu-row-state{text-align:left;max-width:100%}}",
 			"@media (prefers-reduced-motion:reduce){.dsh-ocu-dot,.dsh-ocu-spin{animation:none}}"
 		].join("\n");
@@ -1852,6 +2247,7 @@ window.__ModuleLoader__.load({
 
 		/** Register the sidebar entry and the page it opens. */
 		function apply(ctx) {
+			state = { ...state, market: { ...state.market, skipHold: readSkipHold() } };
 			ctx.effect(() => ctx.locale.register(NS, TEXT), "dsh-one-click-update: dictionaries");
 			ctx.effect(() => installStyles(), "dsh-one-click-update: styles");
 			ctx.effect(() => startMonitor(ctx), "dsh-one-click-update: monitors");

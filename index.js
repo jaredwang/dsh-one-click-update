@@ -17,9 +17,13 @@
  *        -> write a tiny helper script, spawn it detached, answer 202. The
  *           helper waits for the response, asks the app to quit through
  *           AppleScript (macOS) / taskkill (Windows) / SIGTERM (other POSIX),
- *           waits for the shell to exit, and starts the app again. It never
- *           force-kills a quit the user refused (the shell's own quit
- *           confirmation still wins), and it removes itself.
+ *           waits for the app to actually be gone (on macOS by looking at
+ *           every process under the bundle, because the pid this Host was
+ *           handed may be a wrapper), then opens it again and checks that it
+ *           came up. It never force-kills a quit the user refused (the shell's
+ *           own quit confirmation still wins), it removes itself, and on macOS
+ *           it appends every decision to `$(TMPDIR)/dsh-one-click-update-restart.log`
+ *           so a failed relaunch can be read after the fact.
  *
  * The route only works when the Host was actually spawned by the desktop shell
  * (an IPC channel to the Electron main process exists); a plain `dsh web` Host
@@ -31,18 +35,29 @@
  * plugin that is currently mounted, no matter how often the button is clicked.
  *
  *   GET  /dsh-one-click-update/overlay -> capability document (no side effect)
- *   POST /dsh-one-click-update/overlay {name, version}
+ *   POST /dsh-one-click-update/overlay {name, version, force?}
  *        -> run the host's own package manager (`pnpm add <name>@<version>
  *           --save-exact`, the same invocation the desktop publishes on
  *           `profileContext`) over the running version, then answer 200 with
  *           `restartRequired: true`. Overlaying never unloads the plugin, so it
  *           does not trip the in-use guard; the update lands on disk and the
  *           app restart that the page already offers applies it.
+ *
+ *        `force: true` adds pnpm's `--config.minimum-release-age=0` to that one
+ *        invocation, so a release still inside the profile's
+ *        `minimumReleaseAge` window (the market calls it the maturity hold or
+ *        "冷静期") installs now instead of waiting. It is per request, never a
+ *        policy change: the profile's `pnpm-workspace.yaml` is untouched, and
+ *        the next ordinary install waits again. The market's own `force: true`
+ *        cannot do this on the desktop — it only reaches pnpm on hosts that run
+ *        pnpm themselves (routes.js skips the override when `desktopHost`), and
+ *        its desktop maturity gate refuses a held target before pnpm runs at
+ *        all. This route talks to pnpm directly, which is why it can.
  */
 import { execFileSync, spawn } from "node:child_process";
-import { chmodSync, readFileSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { chmodSync, existsSync, readFileSync, writeFileSync } from "node:fs";
+import { homedir, tmpdir } from "node:os";
+import { dirname, join } from "node:path";
 
 export const PLUGIN_NAME = "dsh-one-click-update";
 export const RESTART_PATH = "/dsh-one-click-update/restart";
@@ -51,8 +66,20 @@ export const OVERLAY_PATH = "/dsh-one-click-update/overlay";
 /** How long the helper waits for the shell to exit before giving up (ms). */
 const QUIT_WAIT_MS = 20_000;
 
+/** How long the quit AppleEvent may take to come back before it is dropped (ms). */
+const QUIT_ACK_MS = 15_000;
+
+/** How long one open attempt gets to bring the app back before the next (ms). */
+const REOPEN_WAIT_MS = 10_000;
+
 /** How long one overlay install may take before it is abandoned (ms). */
 const OVERLAY_TIMEOUT_MS = 300_000;
+
+/**
+ * pnpm's own switch for the fresh-release hold (`minimumReleaseAge`, 24h by
+ * default). Passed on one command line, so the profile keeps its policy.
+ */
+export const RELEASE_AGE_OVERRIDE = "--config.minimum-release-age=0";
 
 /* ------------------------------------------------------------------ */
 /* Shell detection                                                     */
@@ -115,32 +142,157 @@ function dq(value) {
 	return '"' + String(value).replace(/"/g, '\\"') + '"';
 }
 
+/**
+ * Path of the helper's log. The helper is detached and the app it kills owns
+ * the terminal, so the log file is the only place its decisions survive.
+ */
+export function restartLogPath(options = {}) {
+	return join(options.tmpdir ?? tmpdir(), `${PLUGIN_NAME}-restart.log`);
+}
+
 function darwinScript(appPath, bundleId, pid) {
 	const quit = bundleId === void 0
 		? `/usr/bin/osascript -e 'tell application ${dq(appPath.replace(/\/[^/]*\.app$/, (m) => m.slice(1, -4)))} to quit'`
 		: `/usr/bin/osascript -e 'tell application id ${dq(bundleId)} to quit'`;
+	const poll = (ms) => Math.ceil(ms / 500);
 	return [
 		"#!/bin/sh",
 		"# dsh-one-click-update: quit the DSH desktop app, then open it again.",
 		"set -u",
 		"trap 'rm -f -- \"$0\"' EXIT",
 		`APP=${shQuote(appPath)}`,
+		`BUNDLE=${bundleId === void 0 ? "''" : shQuote(bundleId)}`,
 		`PID=${Number(pid) || 0}`,
+		`LOG=${shQuote(restartLogPath())}`,
+		"say() {",
+		"\tprintf '%s %s\\n' \"$(date '+%H:%M:%S')\" \"$*\" >> \"$LOG\" 2>/dev/null || true",
+		"}",
+		"# pgrep cannot see the app's main process (its argv is unreadable from here),",
+		"# so a bundle match alone reports the app gone a moment too early. LaunchServices",
+		"# is the one source that knows whether the app is still running, so prefer it",
+		"# and keep the bundle scan as a fallback for hosts without lsappinfo.",
+		"in_ls() {",
+		"\t[ -n \"$BUNDLE\" ] || return 1",
+		"\t[ -x /usr/bin/lsappinfo ] || return 1",
+		"\tasn=$(/usr/bin/lsappinfo find bundleID=\"$BUNDLE\" 2>/dev/null | /usr/bin/head -1)",
+		"\t[ -n \"$asn\" ] || return 1",
+		"\tp=$(/usr/bin/lsappinfo info -only pid \"$asn\" 2>/dev/null | /usr/bin/sed -n 's/.*pid = \\([0-9][0-9]*\\).*/\\1/p')",
+		"\t[ -n \"$p\" ] && [ \"$p\" -gt 1 ] && kill -0 \"$p\" 2>/dev/null",
+		"}",
+		"in_bundle() {",
+		"\t/usr/bin/pgrep -f \"$APP/Contents/MacOS/\" >/dev/null 2>&1",
+		"}",
+		"running() {",
+		"\tin_ls || in_bundle",
+		"}",
+		"# LaunchServices hands the caller's environment to the new process. This",
+		"# helper is started by the DSH Host, which is the Electron binary running",
+		"# with ELECTRON_RUN_AS_NODE=1; passing that through makes the \"app\" start",
+		"# in Node mode (the Dock bounces, no window appears, it exits immediately).",
+		"# Strip the Electron/Node runtime variables so this behaves like a Dock click.",
+		"open_app() {",
+		"\t/usr/bin/env \\",
+		"\t\t-u ELECTRON_RUN_AS_NODE \\",
+		"\t\t-u ELECTRON_NO_ATTACH_CONSOLE \\",
+		"\t\t-u ELECTRON_ENABLE_LOGGING \\",
+		"\t\t-u ELECTRON_ENABLE_STACK_DUMPING \\",
+		"\t\t-u ELECTRON_DEFAULT_ERROR_MODE \\",
+		"\t\t-u NODE_OPTIONS \\",
+		"\t\t-u NODE_PATH \\",
+		"\t\t/usr/bin/open \"$@\"",
+		"}",
+		"# Open, then watch: LaunchServices answers \"ok\" even when it silently",
+		"# activates the app that is still shutting down, so exit status proves nothing.",
+		"try_open() {",
+		"\t\"$@\" >> \"$LOG\" 2>&1",
+		"\tsay \"$* (exit=$?)\"",
+		"\tk=0",
+		`\twhile [ "$k" -lt ${poll(REOPEN_WAIT_MS)} ]; do`,
+		"\t\tif running; then return 0; fi",
+		"\t\tk=$((k + 1))",
+		"\t\tsleep 0.5",
+		"\tdone",
+		"\treturn 1",
+		"}",
+		"came_back() {",
+		"\tsay \"app is back\"",
+		"\t# A launch that dies straight away looks identical for the first second.",
+		"\tsleep 5",
+		"\tif running; then",
+		"\t\tsay \"still up 5s later\"",
+		"\t\texit 0",
+		"\telse",
+		"\t\tsay \"showed up and went away again\"",
+		"\t\t# Do not report success for a process that died during startup: keep",
+		"\t\t# trying the remaining launch methods and rounds.",
+		"\t\treturn 1",
+		"\tfi",
+		"}",
+		"say \"restart requested (pid=$PID)\"",
 		// Let the restart route's HTTP response flush before the app dies.
 		"sleep 0.8",
-		`${quit} >/dev/null 2>&1 || true`,
+		// The quit is an AppleEvent: it returns when the app answers, and if the
+		// app is showing its own confirmation it can sit there for minutes.
+		`${quit} >> \"$LOG\" 2>&1 &`,
+		"q=$!",
+		"k=0",
+		`while [ "$k" -lt ${poll(QUIT_ACK_MS)} ] && kill -0 \"$q\" 2>/dev/null; do`,
+		"\tk=$((k + 1))",
+		"\tsleep 0.5",
+		"done",
+		"if kill -0 \"$q\" 2>/dev/null; then",
+		"\tsay \"quit request still open after the app answered nothing; not waiting on it\"",
+		"\tkill \"$q\" 2>/dev/null || true",
+		"fi",
 		"i=0",
-		`while [ "$i" -lt ${Math.ceil(QUIT_WAIT_MS / 500)} ]; do`,
-		"\tif ! kill -0 \"$PID\" 2>/dev/null; then break; fi",
+		`while [ "$i" -lt ${poll(QUIT_WAIT_MS)} ]; do`,
+		"\tif ! running; then break; fi",
 		"\ti=$((i + 1))",
 		"\tsleep 0.5",
 		"done",
-		"if kill -0 \"$PID\" 2>/dev/null; then",
-		"\t# The quit is waiting for confirmation (or was refused): leave it be.",
-		"\texit 0",
+		"j=0",
+		`while [ "$PID" -gt 1 ] && [ "$j" -lt ${Math.ceil(QUIT_WAIT_MS / 1000)} ] && kill -0 \"$PID\" 2>/dev/null; do`,
+		"\tj=$((j + 1))",
+		"\tsleep 1",
+		"done",
+		"# pgrep cannot see the app's main process, so \"no bundle process\" is not proof",
+		"# on its own; only trust it together with the pid we were handed.",
+		"alive() {",
+		"\tin_bundle && return 0",
+		"\t[ \"$PID\" -gt 1 ] && kill -0 \"$PID\" 2>/dev/null && return 0",
+		"\treturn 1",
+		"}",
+		"if in_ls; then",
+		"\tif alive; then",
+		"\t\t# The quit is waiting for confirmation (or was refused): leave it be.",
+		"\t\tsay \"app is still running after $i polls (waiting for a confirmation?); not reopening\"",
+		"\t\texit 0",
+		"\tfi",
+		"\t# LaunchServices can keep a dead app in its list for a while (it is only",
+		"\t# reaped lazily); with no process left, reopening is safe.",
+		"\tsay \"app left LaunchServices late but no process is left; opening it again\"",
+		"else",
+		"\tsay \"app is gone after $i polls; opening it again\"",
 		"fi",
-		"sleep 0.8",
-		"/usr/bin/open \"$APP\""
+		"# Let LaunchServices forget the old instance before asking for a new one.",
+		"sleep 1",
+		"round=0",
+		"while [ \"$round\" -lt 2 ]; do",
+		"\tround=$((round + 1))",
+		"\tif try_open open_app -a \"$APP\"; then came_back; fi",
+		"\t# Launchd runs the open outside this process tree, which matters when the",
+		"\t# request comes from a helper that the app itself started.",
+		"\tif [ -x /bin/launchctl ]; then",
+		"\t\tif try_open /bin/launchctl submit -l \"com.dsh.one-click-update.reopen.$$\" -- /usr/bin/env -u ELECTRON_RUN_AS_NODE -u ELECTRON_NO_ATTACH_CONSOLE -u ELECTRON_ENABLE_LOGGING -u ELECTRON_ENABLE_STACK_DUMPING -u ELECTRON_DEFAULT_ERROR_MODE -u NODE_OPTIONS -u NODE_PATH /usr/bin/open -a \"$APP\"; then came_back; fi",
+		"\tfi",
+		"\tif [ -n \"$BUNDLE\" ] && try_open open_app -b \"$BUNDLE\"; then came_back; fi",
+		"\tif try_open open_app -n -a \"$APP\"; then came_back; fi",
+		"\tsay \"round $round: the app did not come back\"",
+		"\tsleep 3",
+		"done",
+		"say \"gave up after 2 rounds; the app stayed down\"",
+		"/usr/bin/lsappinfo find bundleID=\"$BUNDLE\" >> \"$LOG\" 2>&1 || true",
+		"exit 1",
 	].join("\n") + "\n";
 }
 
@@ -347,34 +499,104 @@ function installedVersion(directory, name) {
 }
 
 /**
- * The package manager invocation the desktop publishes on `profileContext`,
- * plus the profile directory it belongs to. `undefined` outside the desktop
- * (a plain `dsh web` Host publishes no such context).
+ * The runtime directory of the packaged app this Host runs inside, when there
+ * is one. A Desktop Host is started by the app bundle but is not handed the
+ * bundled pnpm the way the CLI is, so the overlay route looks for the payload
+ * next to the binary itself.
  */
-export function describeOverlayTarget(ctx) {
+export function desktopRuntimeDir(options = {}) {
+	const execPath = options.execPath ?? process.execPath;
+	const resourcesPath = options.resourcesPath ?? process.resourcesPath;
+	const exists = options.exists ?? existsSync;
+	const candidates = [];
+	if (typeof resourcesPath === "string" && resourcesPath !== "") candidates.push(join(resourcesPath, "runtime"));
+	const marker = execPath.lastIndexOf("/Contents/MacOS/");
+	if (marker !== -1) candidates.push(join(execPath.slice(0, marker), "Contents", "Resources", "runtime"));
+	candidates.push(join(dirname(execPath), "resources", "runtime"));
+	return candidates.find((directory) => exists(join(directory, "primary-runtime", "dependencies", "pnpm", "bin", "pnpm.mjs")));
+}
+
+/**
+ * The pnpm the Desktop app ships, invoked exactly the way the shell invokes it
+ * (`ELECTRON_RUN_AS_NODE` turns the app binary into its bundled Node), or
+ * `undefined` outside a packaged app.
+ */
+export function bundledPackageManager(options = {}) {
+	const runtime = desktopRuntimeDir(options);
+	if (runtime === void 0) return void 0;
+	const execPath = options.execPath ?? process.execPath;
+	const separator = process.platform === "win32" ? ";" : ":";
+	return {
+		command: execPath,
+		args: ["--expose-internals", join(runtime, "primary-runtime", "dependencies", "pnpm", "bin", "pnpm.mjs")],
+		env: {
+			ELECTRON_RUN_AS_NODE: "1",
+			DSH_DESKTOP_NODE_EXECUTABLE: execPath,
+			PATH: `${join(runtime, "bin")}${separator}${process.env.PATH ?? ""}`
+		}
+	};
+}
+
+/**
+ * The profile directory to install into: what the Host publishes, or — when a
+ * packaged app Host publishes nothing usable — the reserved `desktop` profile
+ * under `$DSH_HOME`, which is the only profile the packaged app owns.
+ */
+function profileDirectoryOf(context, insideApp, options = {}) {
+	for (const candidate of [context?.dir, context?.profileDirectory]) {
+		if (typeof candidate === "string" && candidate !== "") return candidate;
+	}
+	if (insideApp !== true) return void 0;
+	const exists = options.exists ?? existsSync;
+	const home = options.home ?? process.env.DSH_HOME ?? join(homedir(), ".dsh");
+	const named = typeof context?.profile === "string" && context.profile !== "" ? context.profile : "desktop";
+	const directory = join(home, "profiles", named);
+	return exists(join(directory, "package.json")) ? directory : void 0;
+}
+
+/**
+ * The profile directory and package manager an overlay install needs.
+ *
+ * Newer Hosts publish `dir` (not `profileDirectory`) and no `packageManager`;
+ * older ones publish both. When neither carries an invocation, the pnpm that
+ * ships with the Desktop app is used, so the route keeps working on Hosts that
+ * were never handed one.
+ */
+export function describeOverlayTarget(ctx, options = {}) {
 	let context;
 	try {
 		context = typeof ctx?.get === "function" ? ctx.get("profileContext") : void 0;
 	} catch (error) {
 		context = void 0;
 	}
-	const invocation = context?.packageManager;
-	const directory = context?.profileDirectory;
+	const hostInvocation = context?.packageManager;
+	const bundled = hostInvocation === void 0 ? bundledPackageManager(options) : void 0;
+	const directory = profileDirectoryOf(context, bundled !== void 0, options);
+	const invocation = hostInvocation ?? bundled;
+	const detail = {
+		directory: directory !== void 0,
+		packageManager: hostInvocation !== void 0,
+		bundled: bundled !== void 0,
+		runtime: desktopRuntimeDir(options)
+	};
+	if (directory === void 0) return { available: false, reason: "no-profile-directory", detail };
 	if (
 		invocation === undefined || invocation === null || typeof invocation.command !== "string" ||
-		invocation.command.trim() === "" || typeof directory !== "string" || directory === ""
+		invocation.command.trim() === ""
 	) {
-		return { available: false, reason: "not-desktop-host" };
+		return { available: false, reason: "no-package-manager", detail };
 	}
 	return {
 		available: true,
-		profile: typeof context.profile === "string" ? context.profile : void 0,
+		source: hostInvocation === undefined ? "bundled" : "host",
+		profile: typeof context?.profile === "string" ? context.profile : void 0,
 		directory,
 		invocation: {
 			command: invocation.command,
 			args: Array.isArray(invocation.args) ? invocation.args.map(String) : [],
 			env: invocation.env !== null && typeof invocation.env === "object" ? invocation.env : {}
-		}
+		},
+		detail
 	};
 }
 
@@ -502,7 +724,16 @@ export function createOverlayHandler(options = {}) {
 				ok: true,
 				overlay: current.available === true,
 				reason: current.reason,
-				profile: current.profile
+				profile: current.profile,
+				// Whether this Host can lift the profile's release-age wait for one
+				// install. True on every desktop Host that has this route at all;
+				// a page from an older bundle reads the absence as "no".
+				force: current.available === true,
+				source: current.source,
+				releaseAgeOverride: current.available === true ? RELEASE_AGE_OVERRIDE : void 0,
+				// Where the answer came from, so a page can say why the route is
+				// unavailable instead of guessing that the Host half is stale.
+				detail: current.detail
 			});
 			return;
 		}
@@ -527,6 +758,7 @@ export function createOverlayHandler(options = {}) {
 		const body = await readJsonBody(request);
 		const name = typeof body?.name === "string" ? body.name.trim() : "";
 		const version = typeof body?.version === "string" ? body.version.trim() : "";
+		const force = body?.force === true;
 		if (NAME_PATTERN.test(name) !== true) {
 			sendJson(response, 400, { ok: false, error: "invalid package name" });
 			return;
@@ -552,7 +784,11 @@ export function createOverlayHandler(options = {}) {
 		}
 		busy = true;
 		try {
-			const result = await run(current, ["add", `${name}@${version}`, "--save-exact"]);
+			// `--save-exact` pins what the manifest already declares; the override is
+			// scoped to this one pnpm call (see the header comment).
+			const args = ["add", `${name}@${version}`, "--save-exact"];
+			if (force) args.push(RELEASE_AGE_OVERRIDE);
+			const result = await run(current, args);
 			const output = `${result.stdout}\n${result.stderr}`.trim().slice(-1200);
 			if (result.timedOut === true) {
 				sendJson(response, 504, {
@@ -601,7 +837,8 @@ export function createOverlayHandler(options = {}) {
 				name,
 				version,
 				from: from === "" ? void 0 : from,
-				restartRequired: true
+				restartRequired: true,
+				...(force ? { forced: true, releaseAgeOverride: RELEASE_AGE_OVERRIDE } : {})
 			});
 		} catch (error) {
 			sendJson(response, 500, { ok: false, error: error instanceof Error ? error.message : String(error) });
@@ -626,7 +863,7 @@ export function createRestartHandler(options = {}) {
 			return;
 		}
 		if (request.method === "GET") {
-			sendJson(response, 200, { ok: true, restart: publicPlan(plan()) });
+			sendJson(response, 200, { ok: true, restart: publicPlan(plan()), log: restartLogPath() });
 			return;
 		}
 		if (request.method !== "POST") {
@@ -661,7 +898,7 @@ export function createRestartHandler(options = {}) {
 				busy = false;
 			}, 60_000);
 			if (typeof timer.unref === "function") timer.unref();
-			sendJson(response, 202, { ok: true, helper: file, restart: publicPlan(current) });
+			sendJson(response, 202, { ok: true, helper: file, log: restartLogPath(), restart: publicPlan(current) });
 		} catch (error) {
 			busy = false;
 			sendJson(response, 500, { error: error instanceof Error ? error.message : String(error) });

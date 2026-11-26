@@ -72,6 +72,22 @@ const QUIT_ACK_MS = 15_000;
 /** How long one open attempt gets to bring the app back before the next (ms). */
 const REOPEN_WAIT_MS = 10_000;
 
+/**
+ * How long a freshly opened app must keep running before it counts as back. A
+ * relaunch that fails the single-instance lock comes up and quits within a
+ * second, so a short positive check is not enough (ms).
+ */
+const STABILITY_MS = 5_000;
+
+/**
+ * Quiet beat before the first open, so LaunchServices has forgotten the old
+ * instance and its single-instance files are gone (ms).
+ */
+const REOPEN_SETTLE_MS = 2_000;
+
+/** How long to wait inside one settle for the app's owner pid to really die (ms). */
+const OWNER_WAIT_MS = 20_000;
+
 /** How long one overlay install may take before it is abandoned (ms). */
 const OVERLAY_TIMEOUT_MS = 300_000;
 
@@ -150,6 +166,17 @@ export function restartLogPath(options = {}) {
 	return join(options.tmpdir ?? tmpdir(), `${PLUGIN_NAME}-restart.log`);
 }
 
+/**
+ * Directory that holds Chromium's Desktop-profile single-instance files. It
+ * lives under Electron's `appData`, which for this app is
+ * `~/Library/Application Support/@deepseek-ai/dsh-desktop`. Pinning it as an
+ * absolute path matters: the helper runs detached from the shell and must not
+ * rely on the caller's environment to find these files.
+ */
+export function desktopSingletonDir(options = {}) {
+	return options.singletonDir ?? join(homedir(), "Library", "Application Support", "@deepseek-ai", "dsh-desktop");
+}
+
 function darwinScript(appPath, bundleId, pid) {
 	const quit = bundleId === void 0
 		? `/usr/bin/osascript -e 'tell application ${dq(appPath.replace(/\/[^/]*\.app$/, (m) => m.slice(1, -4)))} to quit'`
@@ -163,6 +190,7 @@ function darwinScript(appPath, bundleId, pid) {
 		`APP=${shQuote(appPath)}`,
 		`BUNDLE=${bundleId === void 0 ? "''" : shQuote(bundleId)}`,
 		`PID=${Number(pid) || 0}`,
+		`SINGLETON_DIR=${shQuote(desktopSingletonDir())}`,
 		`LOG=${shQuote(restartLogPath())}`,
 		"say() {",
 		"\tprintf '%s %s\\n' \"$(date '+%H:%M:%S')\" \"$*\" >> \"$LOG\" 2>/dev/null || true",
@@ -231,7 +259,7 @@ function darwinScript(appPath, bundleId, pid) {
 		"say \"restart requested (pid=$PID)\"",
 		// Let the restart route's HTTP response flush before the app dies.
 		"sleep 0.8",
-		// The quit is an AppleEvent: it returns when the app answers, and if the
+		// The quit is an AppleEvent: it returns when the app answers, and if the",
 		// app is showing its own confirmation it can sit there for minutes.
 		`${quit} >> \"$LOG\" 2>&1 &`,
 		"q=$!",
@@ -274,8 +302,37 @@ function darwinScript(appPath, bundleId, pid) {
 		"else",
 		"\tsay \"app is gone after $i polls; opening it again\"",
 		"fi",
-		"# Let LaunchServices forget the old instance before asking for a new one.",
-		"sleep 1",
+		"# Chromium's single-instance lock lives in appData, not the profile, and a",
+		"# relaunch that finds it still pointing at the instance that is winding down",
+		"# quits itself within a second. That window is what made the app bounce back",
+		"# and disappear at 11:56. Wait until the owner pid in the lock is really gone,",
+		"# then unlink the three stale files so the new instance starts clean.",
+		"stale_owner() {",
+		"\t[ -L \"$SINGLETON_DIR/SingletonLock\" ] || return 1",
+		"\ttarget=$(/bin/ls -l \"$SINGLETON_DIR/SingletonLock\" 2>/dev/null)",
+		"\t[ -n \"$target\" ] || return 1",
+		"\towner=$(printf '%s' \"$target\" | /usr/bin/sed -n 's/.*->[^0-9]*\\([0-9][0-9]*\\)$/\\1/p')",
+		"\t[ -n \"$owner\" ] && [ \"$owner\" -gt 1 ] && kill -0 \"$owner\" 2>/dev/null",
+		"}",
+		"w=0",
+		`while [ "$w" -lt ${Math.ceil(OWNER_WAIT_MS / 500)} ] && stale_owner; do`,
+		"\tw=$((w + 1))",
+		"\tsleep 0.5",
+		"done",
+		"if stale_owner; then",
+		"\tsay \"single-instance owner still alive after $w polls; leaving the lock alone\"",
+		"else",
+		"\tcleared=0",
+		"\tfor f in SingletonLock SingletonSocket SingletonCookie; do",
+		"\t\tif [ -e \"$SINGLETON_DIR/$f\" ] || [ -L \"$SINGLETON_DIR/$f\" ]; then",
+		"\t\t\trm -f \"$SINGLETON_DIR/$f\" 2>/dev/null && cleared=$((cleared + 1))",
+		"\t\tfi",
+		"\tdone",
+		"\tsay \"cleared $cleared stale single-instance file(s)\"",
+		"fi",
+		"# Give LaunchServices and the kernel a quiet beat before asking for a new",
+		"# instance; opening the same instant keeps landing on the dying one.",
+		`sleep ${(REOPEN_SETTLE_MS / 1000).toFixed(1)}`,
 		"round=0",
 		"while [ \"$round\" -lt 2 ]; do",
 		"\tround=$((round + 1))",

@@ -88,6 +88,26 @@ const MAC_EXEC = "/Applications/DeepSeek Harness.app/Contents/MacOS/DeepSeek Har
 	ok("macOS script watches the whole bundle", darwin.script.includes('/usr/bin/pgrep -f "$APP/Contents/MacOS/"'), darwin.script);
 	ok("macOS script logs its decisions", darwin.script.includes("dsh-one-click-update-restart.log") && darwin.script.includes("say \"app is gone"), darwin.script);
 	ok("macOS script removes itself", darwin.script.includes('trap '), darwin.script);
+	ok(
+		"macOS script clears stale single-instance files before reopening",
+		darwin.script.includes("SingletonLock") && darwin.script.includes("SingletonSocket") && darwin.script.includes("SingletonCookie") && darwin.script.includes('rm -f "$SINGLETON_DIR/$f"'),
+		darwin.script
+	);
+	ok(
+		"macOS script waits for the single-instance owner to die before clearing",
+		darwin.script.includes("stale_owner()") && darwin.script.includes('kill -0 "$owner"'),
+		darwin.script
+	);
+	ok(
+		"macOS script points at the desktop appData singleton dir",
+		darwin.script.includes("@deepseek-ai/dsh-desktop") && darwin.script.includes('SINGLETON_DIR='),
+		darwin.script
+	);
+	ok(
+		"macOS script gives LaunchServices a settle beat before the first open",
+		/sleep 2\.0\nround=0/.test(darwin.script) || darwin.script.includes("sleep 2.0"),
+		darwin.script
+	);
 
 	const noBundle = restartPlan({
 		desktop: true,

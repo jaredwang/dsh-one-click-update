@@ -89,6 +89,11 @@ const MAC_EXEC = "/Applications/DeepSeek Harness.app/Contents/MacOS/DeepSeek Har
 	ok("macOS script logs its decisions", darwin.script.includes("dsh-one-click-update-restart.log") && darwin.script.includes("say \"app is gone"), darwin.script);
 	ok("macOS script removes itself", darwin.script.includes('trap '), darwin.script);
 	ok(
+		"macOS script never submits a rescheduling launchctl job",
+		!/launchctl\s+submit/.test(darwin.script) && !/launchctl submit -l/.test(darwin.script),
+		darwin.script
+	);
+	ok(
 		"macOS script clears stale single-instance files before reopening",
 		darwin.script.includes("SingletonLock") && darwin.script.includes("SingletonSocket") && darwin.script.includes("SingletonCookie") && darwin.script.includes('rm -f "$SINGLETON_DIR/$f"'),
 		darwin.script

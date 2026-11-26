@@ -1,6 +1,6 @@
 {
   "name": "dsh-one-click-update",
-  "version": "0.6.5",
+  "version": "0.6.6",
   "type": "module",
   "description": "One-click, zero-effort updates for the DSH desktop app: update all plugins and the app from a single sidebar entry, wait out maturity holds or skip them with a switch, and restart DSH in place.",
   "license": "MIT",

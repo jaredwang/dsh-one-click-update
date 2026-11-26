@@ -134,9 +134,15 @@ npm test        # = node test/smoke.mjs && node test/host.mjs
 node --check client.js
 ```
 
-冒烟测试不依赖任何 npm 包：它用一个 mini React 与伪 `fetch` / 伪桌面桥渲染真实的 `client.js`，覆盖自动开始、串行更新、失败重试、**成熟期等待（不是失败）**、**已挂载插件回退覆盖安装（以及 Host 未加载路由时的受阻提示）**、**跳过冷静期的开关/单行/全部安装/旧 Host 退回/无 pnpm Host 的手动指引**、客户端更新后的自动刷新、**常驻重启按钮（空闲时的安静样式与请求）**、无插件市场、无桌面桥，以及最新版仍在成熟期的插件独立成类且不参与更新（即使 v1 把它列为可更新）、旧市场没有面板接口时退回纯 v1 视图、App 状态晚到（慢 `updates.status()`）仍会自动打开更新、**更新记录因市场重载丢失（已装/未装两种）**、**锁被其他操作占用（POST 409 与操作结果两条路径）**等路径，以及**安装交接超时后的自动重试**、**Host 尚在热重载时先探测再打开**等路径（155 项断言）。`test/host.mjs` 用假的 `ctx` / request / response 覆盖 macOS / Windows / Linux 的重启脚本、非桌面 Host 的 501、外站 Origin 的 403、重复重启的 409、覆盖安装的参数/版本/依赖/成熟期/落盘校验与并发 409，以及**强制覆盖安装的 argv（`--config.minimum-release-age=0`）与响应标记**、两条路由的注册与清理（98 项断言）。
+冒烟测试不依赖任何 npm 包：它用一个 mini React 与伪 `fetch` / 伪桌面桥渲染真实的 `client.js`，覆盖自动开始、串行更新、失败重试、**成熟期等待（不是失败）**、**已挂载插件回退覆盖安装（以及 Host 未加载路由时的受阻提示）**、**跳过冷静期的开关/单行/全部安装/旧 Host 退回/无 pnpm Host 的手动指引**、客户端更新后的自动刷新、**常驻重启按钮（空闲时的安静样式与请求）**、无插件市场、无桌面桥，以及最新版仍在成熟期的插件独立成类且不参与更新（即使 v1 把它列为可更新）、旧市场没有面板接口时退回纯 v1 视图、App 状态晚到（慢 `updates.status()`）仍会自动打开更新、**更新记录因市场重载丢失（已装/未装两种）**、**锁被其他操作占用（POST 409 与操作结果两条路径）**等路径，以及**安装交接超时后的自动重试**、**Host 尚在热重载时先探测再打开**等路径（155 项断言）。`test/host.mjs` 用假的 `ctx` / request / response 覆盖 macOS / Windows / Linux 的重启脚本、非桌面 Host 的 501、外站 Origin 的 403、重复重启的 409、覆盖安装的参数/版本/依赖/成熟期/落盘校验与并发 409，以及**强制覆盖安装的 argv（`--config.minimum-release-age=0`）与响应标记**、两条路由的注册与清理（99 项断言）。
 
 ## 更新说明
+
+### 0.6.6
+
+- 修复：**关掉 DSH 后它会自己反复重新打开（无限重开）**。0.6.4 的重开逻辑里有一路是 `launchctl submit` 把「重新打开 App」交给 launchd 执行——本以为是一次性的，但 `launchctl submit` 提交的 job 会被 launchd 判定为「失败就保活」，于是它每隔 10 秒就重新跑一次 `open -a`，把 App 一次又一次拉起来（实测那一个 job 触发了 **1226 次**）。0.6.6 直接删掉这一路，重新打开只用 `open_app`（`env -u ELECTRON_RUN_AS_NODE … open -a/-b/-n`），不再往 launchd 里注册任何常驻 job。
+- 说明：如果你之前点过重启，机器上可能残留一个名为 `com.dsh.one-click-update.reopen.<pid>` 的 launchd job 在持续拉起 App。升级后不会再产生新的；已存在的可以用 `launchctl remove com.dsh.one-click-update.reopen.<pid>` 清掉（或重启一次电脑）。
+- 测试：`test/host.mjs` 新增「重启脚本不得提交会自我重排的 launchctl job」断言，共 99 项断言；`test/smoke.mjs` 共 155 项断言。
 
 ### 0.6.5
 
